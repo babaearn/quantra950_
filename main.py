@@ -423,28 +423,30 @@ def fetch_binance_perp_funding_rate(symbol: str) -> Optional[float]:
         log.error(f"Error fetching Binance funding rate: {e}")
         return None
 
-def fetch_aggregated_oi_manual(symbol: str) -> Optional[float]:
-    """Manually aggregate OI from multiple exchanges as fallback"""
+def fetch_aggregated_oi_manual(symbol: str, current_price: float) -> Optional[float]:
+    """Manually aggregate OI from multiple exchanges and convert to USD value"""
     try:
-        total_oi = 0.0
+        total_oi_usd = 0.0
         
-        # Get Binance Perp OI
+        # Get Binance Perp OI (returns in base asset, need to convert to USD)
         binance_oi = fetch_binance_perp_open_interest(symbol)
-        if binance_oi and binance_oi > 0:
-            total_oi += binance_oi
-            log.info(f"Binance Perp OI: ${binance_oi:,.0f}")
+        if binance_oi and binance_oi > 0 and current_price > 0:
+            binance_oi_usd = binance_oi * current_price
+            total_oi_usd += binance_oi_usd
+            log.info(f"Binance Perp OI: {binance_oi:.2f} {symbol[:3]} = ${binance_oi_usd:,.0f}")
         
-        # Get Bybit Perp OI (if available in ticker)
+        # Get Bybit Perp OI (also in base asset, need to convert)
         bybit_ticker = fetch_bybit_perp_ticker(symbol)
         if bybit_ticker and bybit_ticker.get("openInterest"):
             bybit_oi = safe_float(bybit_ticker["openInterest"])
-            if bybit_oi > 0:
-                total_oi += bybit_oi
-                log.info(f"Bybit Perp OI: ${bybit_oi:,.0f}")
+            if bybit_oi > 0 and current_price > 0:
+                bybit_oi_usd = bybit_oi * current_price
+                total_oi_usd += bybit_oi_usd
+                log.info(f"Bybit Perp OI: {bybit_oi:.2f} {symbol[:3]} = ${bybit_oi_usd:,.0f}")
         
-        if total_oi > 0:
-            log.info(f"✅ Manual aggregated OI for {symbol}: ${total_oi:,.0f}")
-            return total_oi
+        if total_oi_usd > 0:
+            log.info(f"✅ Manual aggregated OI for {symbol}: ${total_oi_usd:,.0f}")
+            return total_oi_usd
         
         return None
     except Exception as e:
@@ -1025,6 +1027,9 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
         exchange_funding = fetch_binance_perp_funding_rate(resolved)
     
     # Open Interest - Multi-tier approach for accuracy
+    # Get current price first (needed for OI conversion)
+    last_price = safe_float(t.get("lastPrice", 0))
+    
     # 1. Try CoinGlass (aggregated across all exchanges)
     if coinglass_data.get("open_interest") is not None:
         oi_value = safe_float(coinglass_data["open_interest"])
@@ -1036,8 +1041,8 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     else:
         log.warning("CoinGlass OI unavailable, trying manual aggregation...")
         
-        # 2. Try manual aggregation (Binance + Bybit)
-        manual_oi = fetch_aggregated_oi_manual(resolved)
+        # 2. Try manual aggregation (Binance + Bybit, converted to USD)
+        manual_oi = fetch_aggregated_oi_manual(resolved, last_price)
         if manual_oi and manual_oi > 0:
             oi_line = f"• Open Interest: {fmt_large_number(manual_oi)} (Aggregated)\n"
             log.info(f"Using manual aggregated OI: ${manual_oi:,.0f}")
@@ -1046,9 +1051,13 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
             log.warning("Manual aggregation failed, falling back to single exchange...")
             exchange_oi = None
             if exchange == "Bybit Perpetual":
-                exchange_oi = safe_float(t.get("openInterest", 0))
+                bybit_oi_contracts = safe_float(t.get("openInterest", 0))
+                if bybit_oi_contracts > 0 and last_price > 0:
+                    exchange_oi = bybit_oi_contracts * last_price
             elif exchange == "Binance Perpetual":
-                exchange_oi = fetch_binance_perp_open_interest(resolved)
+                binance_oi_contracts = fetch_binance_perp_open_interest(resolved)
+                if binance_oi_contracts and binance_oi_contracts > 0 and last_price > 0:
+                    exchange_oi = binance_oi_contracts * last_price
             
             if exchange_oi and exchange_oi > 0:
                 oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)} ({exchange})\n"
@@ -1074,7 +1083,6 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     # Liquidations - Use volatility-based estimation
     high = safe_float(t.get("highPrice", 0))
     low = safe_float(t.get("lowPrice", 0))
-    last_price = safe_float(t.get("lastPrice", 0))
     
     if last_price > 0:
         volatility = ((high - low) / last_price) * 100
