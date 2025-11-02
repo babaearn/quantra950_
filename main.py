@@ -52,6 +52,7 @@ log = logging.getLogger("mudrex_mi_bot")
 # Environment Variables (Railway)
 # -----------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")  # Optional: for higher limits
 PORT = int(os.getenv("PORT", 8080))
 
 # -----------------------
@@ -220,13 +221,19 @@ def _http_get_binance(path: str, params: dict, use_futures: bool = True) -> Opti
     return None
 
 def _http_get_coinglass(endpoint: str, params: dict = None) -> Optional[dict]:
-    """HTTP GET for CoinGlass API"""
+    """HTTP GET for CoinGlass API with optional API key"""
     try:
         url = f"{COINGLASS_API_BASE}{endpoint}"
-        r = requests.get(url, params=params or {}, timeout=COINGLASS_TIMEOUT)
+        headers = {}
+        if COINGLASS_API_KEY:
+            headers["CG-API-KEY"] = COINGLASS_API_KEY
+        
+        r = requests.get(url, params=params or {}, headers=headers, timeout=COINGLASS_TIMEOUT)
         if r.status_code == 200:
             return r.json()
-        return None
+        else:
+            log.warning(f"CoinGlass API returned status {r.status_code}: {r.text[:200]}")
+            return None
     except Exception as e:
         log.warning(f"CoinGlass API error: {e}")
         return None
@@ -416,6 +423,34 @@ def fetch_binance_perp_funding_rate(symbol: str) -> Optional[float]:
         log.error(f"Error fetching Binance funding rate: {e}")
         return None
 
+def fetch_aggregated_oi_manual(symbol: str) -> Optional[float]:
+    """Manually aggregate OI from multiple exchanges as fallback"""
+    try:
+        total_oi = 0.0
+        
+        # Get Binance Perp OI
+        binance_oi = fetch_binance_perp_open_interest(symbol)
+        if binance_oi and binance_oi > 0:
+            total_oi += binance_oi
+            log.info(f"Binance Perp OI: ${binance_oi:,.0f}")
+        
+        # Get Bybit Perp OI (if available in ticker)
+        bybit_ticker = fetch_bybit_perp_ticker(symbol)
+        if bybit_ticker and bybit_ticker.get("openInterest"):
+            bybit_oi = safe_float(bybit_ticker["openInterest"])
+            if bybit_oi > 0:
+                total_oi += bybit_oi
+                log.info(f"Bybit Perp OI: ${bybit_oi:,.0f}")
+        
+        if total_oi > 0:
+            log.info(f"✅ Manual aggregated OI for {symbol}: ${total_oi:,.0f}")
+            return total_oi
+        
+        return None
+    except Exception as e:
+        log.error(f"Error in manual OI aggregation: {e}")
+        return None
+
 # -----------------------
 # Binance Spot Functions (FALLBACK)
 # -----------------------
@@ -473,27 +508,43 @@ def fetch_coinglass_data(symbol: str) -> Dict[str, Any]:
     
     try:
         base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+        log.info(f"Fetching CoinGlass data for {base_symbol}...")
         
-        # Open Interest
-        oi_data = _http_get_coinglass(f"/indicator/open-interest", {"symbol": base_symbol})
-        if oi_data and oi_data.get("success") and oi_data.get("data"):
-            result["open_interest"] = oi_data["data"].get("openInterest")
-            result["oi_change"] = oi_data["data"].get("openInterestChange24h")
+        # Open Interest - try multiple endpoint formats
+        oi_data = _http_get_coinglass("/indicator/open-interest", {"symbol": base_symbol})
+        if oi_data:
+            log.info(f"CoinGlass OI response: {oi_data}")
+            if oi_data.get("success") and oi_data.get("data"):
+                # Try different possible field names
+                oi_value = (
+                    oi_data["data"].get("openInterest") or 
+                    oi_data["data"].get("usdValue") or
+                    oi_data["data"].get("value")
+                )
+                if oi_value:
+                    result["open_interest"] = safe_float(oi_value)
+                    log.info(f"✅ CoinGlass OI for {base_symbol}: ${result['open_interest']:,.0f}")
+                else:
+                    log.warning(f"⚠️ CoinGlass returned success but no OI value in data: {oi_data['data'].keys()}")
+            else:
+                log.warning(f"⚠️ CoinGlass OI request failed: success={oi_data.get('success')}, data={oi_data.get('data')}")
+        else:
+            log.warning(f"⚠️ CoinGlass OI request returned None for {base_symbol}")
         
         # Funding Rate
-        fr_data = _http_get_coinglass(f"/indicator/funding-rate", {"symbol": base_symbol})
+        fr_data = _http_get_coinglass("/indicator/funding-rate", {"symbol": base_symbol})
         if fr_data and fr_data.get("success") and fr_data.get("data"):
             result["funding_rate"] = fr_data["data"].get("fundingRate")
         
         # Liquidations
-        liq_data = _http_get_coinglass(f"/indicator/liquidation", {"symbol": base_symbol})
+        liq_data = _http_get_coinglass("/indicator/liquidation", {"symbol": base_symbol})
         if liq_data and liq_data.get("success") and liq_data.get("data"):
             result["liquidations_24h"] = liq_data["data"].get("liquidation24h")
             result["liq_long"] = liq_data["data"].get("longLiquidation24h")
             result["liq_short"] = liq_data["data"].get("shortLiquidation24h")
             
     except Exception as e:
-        log.warning(f"Error fetching CoinGlass data: {e}")
+        log.error(f"Error fetching CoinGlass data: {e}")
     
     return result
 
@@ -973,28 +1024,40 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     elif exchange == "Binance Perpetual":
         exchange_funding = fetch_binance_perp_funding_rate(resolved)
     
-    # Open Interest - Use CoinGlass API for accurate aggregated data
+    # Open Interest - Multi-tier approach for accuracy
+    # 1. Try CoinGlass (aggregated across all exchanges)
     if coinglass_data.get("open_interest") is not None:
         oi_value = safe_float(coinglass_data["open_interest"])
         if oi_value > 0:
-            oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
+            oi_line = f"• Open Interest: {fmt_large_number(oi_value)} (CoinGlass)\n"
+            log.info(f"Using CoinGlass OI: ${oi_value:,.0f}")
         else:
             oi_line = "• Open Interest: Data unavailable\n"
     else:
-        # Fallback: Try exchange-specific OI if CoinGlass unavailable
-        exchange_oi = None
-        if exchange == "Bybit Perpetual":
-            exchange_oi = safe_float(t.get("openInterest", 0))
-        elif exchange == "Binance Perpetual":
-            exchange_oi = fetch_binance_perp_open_interest(resolved)
+        log.warning("CoinGlass OI unavailable, trying manual aggregation...")
         
-        if exchange_oi and exchange_oi > 0:
-            oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)}\n"
+        # 2. Try manual aggregation (Binance + Bybit)
+        manual_oi = fetch_aggregated_oi_manual(resolved)
+        if manual_oi and manual_oi > 0:
+            oi_line = f"• Open Interest: {fmt_large_number(manual_oi)} (Aggregated)\n"
+            log.info(f"Using manual aggregated OI: ${manual_oi:,.0f}")
         else:
-            if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
-                oi_line = "• Open Interest: Data unavailable\n"
+            # 3. Try single exchange as last resort
+            log.warning("Manual aggregation failed, falling back to single exchange...")
+            exchange_oi = None
+            if exchange == "Bybit Perpetual":
+                exchange_oi = safe_float(t.get("openInterest", 0))
+            elif exchange == "Binance Perpetual":
+                exchange_oi = fetch_binance_perp_open_interest(resolved)
+            
+            if exchange_oi and exchange_oi > 0:
+                oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)} ({exchange})\n"
+                log.warning(f"Using single exchange OI: ${exchange_oi:,.0f}")
             else:
-                oi_line = ""  # Don't show OI for spot markets
+                if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
+                    oi_line = "• Open Interest: Data unavailable\n"
+                else:
+                    oi_line = ""  # Don't show OI for spot markets
     
     # Funding Rate - Use exchange data
     if exchange_funding is not None:
