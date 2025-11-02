@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ['python311', 'gcc', 'stdenv.cc.cc.lib']
+
+[phases.install]
+cmds = [
+    'pip install --upgrade pip setuptools wheel',
+    'pip install --prefer-binary -r requirements.txt'
+]
+
+[start]
+cmd = 'python -u main.py'
