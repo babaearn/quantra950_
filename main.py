@@ -86,6 +86,10 @@ BINANCE_HOSTS = [
 COINGLASS_API_BASE = "https://open-api.coinglass.com/public/v2"
 COINGLASS_TIMEOUT = 5
 
+# Mudrex API Configuration
+MUDREX_API_BASE = "https://price.mudrex.com/api/v1"
+MUDREX_TIMEOUT = 10
+
 HTTP_TIMEOUT = 5
 EXCHANGEINFO_TTL = 30 * 60
 
@@ -236,6 +240,25 @@ def _http_get_coinglass(endpoint: str, params: dict = None) -> Optional[dict]:
             return None
     except Exception as e:
         log.warning(f"CoinGlass API error: {e}")
+        return None
+
+def _http_get_mudrex(endpoint: str, params: dict = None) -> Optional[dict]:
+    """HTTP GET for Mudrex API"""
+    try:
+        url = f"{MUDREX_API_BASE}{endpoint}"
+        r = requests.get(url, params=params or {}, timeout=MUDREX_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success"):
+                return data
+            else:
+                log.warning(f"Mudrex API returned success=false: {data.get('message')}")
+                return None
+        else:
+            log.warning(f"Mudrex API returned status {r.status_code}")
+            return None
+    except Exception as e:
+        log.warning(f"Mudrex API error: {e}")
         return None
 
 # -----------------------
@@ -453,8 +476,71 @@ def fetch_aggregated_oi_manual(symbol: str, current_price: float) -> Optional[fl
         log.error(f"Error in manual OI aggregation: {e}")
         return None
 
+def fetch_mudrex_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch klines from Mudrex API - provides complete data for all coins"""
+    try:
+        # Parse symbol to base/quote
+        base_currency = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+        quote_currency = "USDT"
+        
+        # Map interval to Mudrex aggregation format
+        aggregation_map = {
+            "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "8h": "8h", "12h": "12h",
+            "1d": "1d", "3d": "3d", "1w": "1w"
+        }
+        aggregation = aggregation_map.get(interval, "1h")
+        
+        # Calculate duration to get enough candles
+        duration_map = {
+            "1m": "2d", "3m": "1w", "5m": "1w", "15m": "2w", "30m": "1M",
+            "1h": "5d", "2h": "10d", "4h": "20d", "6h": "30d", "8h": "40d", "12h": "60d",
+            "1d": "120d", "3d": "1y", "1w": "3y"
+        }
+        duration = duration_map.get(interval, "5d")
+        
+        log.info(f"Fetching Mudrex klines for {base_currency}/{quote_currency} {interval}")
+        
+        endpoint = f"/asset/{base_currency}/{quote_currency}/klines"
+        params = {
+            "duration": duration,
+            "aggregation": aggregation,
+            "type": "LINEAR"  # Perpetual futures
+        }
+        
+        data = _http_get_mudrex(endpoint, params)
+        if not data or "data" not in data:
+            log.warning(f"Mudrex klines unavailable for {symbol}")
+            return None
+        
+        klines_data = data["data"]
+        if not klines_data or len(klines_data) == 0:
+            log.warning(f"Mudrex returned empty klines for {symbol}")
+            return None
+        
+        # Convert Mudrex format to standard format
+        klines = []
+        for k in klines_data[-limit:]:  # Take last 'limit' candles
+            klines.append([
+                k.get("timestamp", 0),
+                str(k.get("open", 0)),
+                str(k.get("high", 0)),
+                str(k.get("low", 0)),
+                str(k.get("close", 0)),
+                str(k.get("volume", 0)),
+                k.get("timestamp", 0)
+            ])
+        
+        log.info(f"✅ Got {len(klines)} Mudrex klines for {symbol} at {interval}")
+        return klines
+        
+    except Exception as e:
+        log.error(f"Error fetching Mudrex klines: {e}")
+        return None
+
 # -----------------------
 # Binance Spot Functions (FALLBACK)
+# -----------------------
 # -----------------------
 def _binance_spot_symbol_exists(symbol: str) -> bool:
     """Check if a spot symbol exists on Binance with caching"""
@@ -992,7 +1078,11 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     if not t or "lastPrice" not in t:
         return f"Could not fetch 24h stats for {resolved} from {exchange}. Try again later."
 
-    kl = fetch_klines(resolved, exchange, interval=interval, limit=100)
+    # Fetch klines - Try Mudrex first (complete data), fallback to exchange
+    kl = fetch_mudrex_klines(resolved, interval, limit=100)
+    if not kl or len(kl) < 50:
+        log.info(f"Mudrex klines insufficient, trying exchange...")
+        kl = fetch_klines(resolved, exchange, interval=interval, limit=100)
 
     ta_details = None
     rating = "N/A"
@@ -1001,6 +1091,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     volume_signal = "N/A"
     volume_desc = ""
     
+    # Try technical analysis with requested timeframe
     if kl and len(kl) >= 50:
         try:
             ta = EnhancedTechnicalAnalysis(kl)
@@ -1010,6 +1101,22 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
             volume_desc = ta_details.get("volume_desc", "")
         except Exception as e:
             log.warning("Enhanced TA failed for %s: %s", resolved, e)
+    elif kl and len(kl) < 50:
+        # Fallback: Try with 4h timeframe if daily doesn't have enough data
+        log.info(f"Only {len(kl)} candles for {interval}, trying 4h fallback...")
+        kl_fallback = fetch_klines(resolved, exchange, interval="4h", limit=100)
+        if kl_fallback and len(kl_fallback) >= 50:
+            try:
+                ta = EnhancedTechnicalAnalysis(kl_fallback)
+                rating, score, ta_details = ta.calculate_enhanced_rating()
+                sentiment = ta_details.get("sentiment", "N/A")
+                volume_signal = ta_details.get("volume_signal", "N/A")
+                volume_desc = ta_details.get("volume_desc", "")
+                log.info(f"Using 4h data for TA (requested {interval} had insufficient data)")
+            except Exception as e:
+                log.warning("Enhanced TA fallback failed for %s: %s", resolved, e)
+        else:
+            log.warning(f"Insufficient candle data for {resolved} even on 4h timeframe")
 
     # Build accurate Open Interest, Funding Rate, and Liquidations
     oi_line = ""
@@ -1104,6 +1211,10 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     header = f"🔸 [{resolved} — Market Update](https://mudrex.go.link/f8PJF)"
     if note:
         header += f"\n{note}"
+    
+    # Add note if TA used different timeframe than requested
+    if kl and len(kl) < 50 and ta_details:
+        header += f"\n⚠️ TA based on 4h (insufficient {interval} data)"
 
     return (
         f"{header}\n\n"
