@@ -1,3 +1,9 @@
+# ============================================================================
+# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY
+# ============================================================================
+# Priority: Bybit Perpetual → Binance Perpetual → Spot Fallback
+# ============================================================================
+
 import os
 import time
 import logging
@@ -43,24 +49,16 @@ TELEGRAM_WRITE_TIMEOUT = 30
 TELEGRAM_POOL_TIMEOUT = 30
 
 # -----------------------
-# Exchange Configuration - PRIORITY ORDER: Binance → Bybit → KuCoin
+# Exchange Configuration - PRIORITY: Bybit Perp → Binance Perp → Spot Fallback
 # -----------------------
-BINANCE_HOSTS = [
-    "https://api.binance.com",
-    "https://api-gcp.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
-]
-
 BYBIT_HOSTS = [
     "https://api.bybit.com",
     "https://api.bytick.com"
 ]
 
-KUCOIN_HOSTS = [
-    "https://api.kucoin.com"
+BINANCE_HOSTS = [
+    "https://fapi.binance.com",  # Futures API (PRIMARY)
+    "https://api.binance.com",   # Spot API (FALLBACK)
 ]
 
 # CoinGlass API Configuration
@@ -71,11 +69,10 @@ HTTP_TIMEOUT = 5
 EXCHANGEINFO_TTL = 30 * 60
 
 _exchangeinfo_cache: Dict[str, Any] = {
-    "binance": {"expires": 0, "data": None},
-    "bybit": {"expires": 0, "data": None},
-    "kucoin": {"expires": 0, "data": None}
+    "bybit_perp": {"expires": 0, "data": None},
+    "binance_perp": {"expires": 0, "data": None},
+    "binance_spot": {"expires": 0, "data": None},
 }
-PREFERRED_QUOTES = ["USDT", "FDUSD", "USDC"]
 
 # Interval mappings
 VALID_INTERVALS = {
@@ -86,12 +83,6 @@ INTERVAL_TO_BYBIT = {
     "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
     "1h": "60", "2h": "120", "4h": "240", "6h": "360", "8h": "480", "12h": "720",
     "1d": "D", "3d": "D", "1w": "W"
-}
-
-INTERVAL_TO_KUCOIN = {
-    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1hour", "2h": "2hour", "4h": "4hour", "6h": "6hour", "8h": "6hour", "12h": "12hour",
-    "1d": "1day", "3d": "1day", "1w": "1week"
 }
 
 DEFAULT_INTERVAL = "1h"
@@ -132,27 +123,6 @@ def retry_on_telegram_error(max_retries: int = 3, delay: int = 5):
 # -----------------------
 # HTTP Helper with Failover
 # -----------------------
-def _http_get_binance(path: str, params: dict) -> Optional[requests.Response]:
-    """HTTP GET for Binance with multi-host failover and retry logic"""
-    last_exc = None
-    for host in BINANCE_HOSTS:
-        url = f"{host}{path}"
-        for attempt in range(2):
-            try:
-                r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-                if 400 <= r.status_code < 500 and r.status_code != 429:
-                    return r
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                if r.status_code == 200:
-                    return r
-            except requests.RequestException as e:
-                last_exc = e
-                time.sleep(0.3)
-    log.error(f"Binance HTTP GET FAILED: {path} | Last error: {last_exc}")
-    return None
-
 def _http_get_bybit(path: str, params: dict) -> Optional[requests.Response]:
     """HTTP GET for Bybit with retry logic"""
     last_exc = None
@@ -174,10 +144,12 @@ def _http_get_bybit(path: str, params: dict) -> Optional[requests.Response]:
     log.error(f"Bybit HTTP GET FAILED: {path} | Last error: {last_exc}")
     return None
 
-def _http_get_kucoin(path: str, params: dict) -> Optional[requests.Response]:
-    """HTTP GET for KuCoin with retry logic"""
+def _http_get_binance(path: str, params: dict, use_futures: bool = True) -> Optional[requests.Response]:
+    """HTTP GET for Binance with futures/spot selection"""
     last_exc = None
-    for host in KUCOIN_HOSTS:
+    hosts = [BINANCE_HOSTS[0]] if use_futures else [BINANCE_HOSTS[1]]
+    
+    for host in hosts:
         url = f"{host}{path}"
         for attempt in range(2):
             try:
@@ -192,7 +164,7 @@ def _http_get_kucoin(path: str, params: dict) -> Optional[requests.Response]:
             except requests.RequestException as e:
                 last_exc = e
                 time.sleep(0.3)
-    log.error(f"KuCoin HTTP GET FAILED: {path} | Last error: {last_exc}")
+    log.error(f"Binance HTTP GET FAILED: {path} | Last error: {last_exc}")
     return None
 
 def _http_get_coinglass(endpoint: str, params: dict = None) -> Optional[dict]:
@@ -208,64 +180,24 @@ def _http_get_coinglass(endpoint: str, params: dict = None) -> Optional[dict]:
         return None
 
 # -----------------------
-# Binance Functions
+# Bybit Perpetual Functions (PRIORITY 1)
 # -----------------------
-def _get_binance_exchangeinfo() -> Optional[dict]:
-    """Get Binance exchange info with caching"""
-    now = time.time()
-    if _exchangeinfo_cache["binance"]["data"] and now < _exchangeinfo_cache["binance"]["expires"]:
-        return _exchangeinfo_cache["binance"]["data"]
-    r = _http_get_binance("/api/v3/exchangeInfo", params={})
-    if not r or r.status_code != 200:
-        return None
-    data = r.json()
-    _exchangeinfo_cache["binance"]["data"] = data
-    _exchangeinfo_cache["binance"]["expires"] = now + EXCHANGEINFO_TTL
-    return data
-
-def _binance_symbol_exists(symbol: str) -> bool:
-    """Check if a trading symbol exists on Binance"""
-    info = _get_binance_exchangeinfo()
-    if info and "symbols" in info:
-        symbols = {s["symbol"] for s in info["symbols"]}
-        if symbol in symbols:
-            return True
-    r = _http_get_binance("/api/v3/exchangeInfo", params={"symbol": symbol})
-    return bool(r and r.status_code == 200)
-
-def fetch_binance_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker statistics from Binance"""
-    r = _http_get_binance("/api/v3/ticker/24hr", params={"symbol": symbol})
-    if not r or r.status_code != 200:
-        return None
-    return r.json()
-
-def fetch_binance_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch candlestick/kline data from Binance"""
-    r = _http_get_binance("/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-    if not r or r.status_code != 200:
-        return None
-    return r.json()
-
-# -----------------------
-# Bybit Functions
-# -----------------------
-def _bybit_symbol_exists(symbol: str) -> bool:
-    """Check if a trading symbol exists on Bybit"""
+def _bybit_perp_symbol_exists(symbol: str) -> bool:
+    """Check if a perpetual symbol exists on Bybit"""
     try:
-        r = _http_get_bybit("/v5/market/tickers", params={"category": "spot", "symbol": symbol})
+        r = _http_get_bybit("/v5/market/tickers", params={"category": "linear", "symbol": symbol})
         if r and r.status_code == 200:
             data = r.json()
             return data.get("retCode") == 0 and data.get("result", {}).get("list")
         return False
     except Exception as e:
-        log.error(f"Error checking Bybit symbol: {e}")
+        log.error(f"Error checking Bybit perp symbol: {e}")
         return False
 
-def fetch_bybit_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker statistics from Bybit"""
+def fetch_bybit_perp_ticker(symbol: str) -> Optional[dict]:
+    """Fetch 24-hour ticker statistics from Bybit Perpetual"""
     try:
-        r = _http_get_bybit("/v5/market/tickers", params={"category": "spot", "symbol": symbol})
+        r = _http_get_bybit("/v5/market/tickers", params={"category": "linear", "symbol": symbol})
         if not r or r.status_code != 200:
             return None
         data = r.json()
@@ -278,18 +210,20 @@ def fetch_bybit_ticker(symbol: str) -> Optional[dict]:
             "priceChangePercent": float(ticker.get("price24hPcnt", 0)) * 100,
             "highPrice": ticker.get("highPrice24h"),
             "lowPrice": ticker.get("lowPrice24h"),
-            "volume": ticker.get("volume24h")
+            "volume": ticker.get("volume24h"),
+            "openInterest": ticker.get("openInterest"),
+            "fundingRate": ticker.get("fundingRate")
         }
     except Exception as e:
-        log.error(f"Error fetching Bybit ticker: {e}")
+        log.error(f"Error fetching Bybit perp ticker: {e}")
         return None
 
-def fetch_bybit_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch candlestick/kline data from Bybit"""
+def fetch_bybit_perp_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch candlestick/kline data from Bybit Perpetual"""
     try:
         bybit_interval = INTERVAL_TO_BYBIT.get(interval, "60")
         r = _http_get_bybit("/v5/market/kline", params={
-            "category": "spot",
+            "category": "linear",
             "symbol": symbol,
             "interval": bybit_interval,
             "limit": limit
@@ -304,72 +238,95 @@ def fetch_bybit_klines(symbol: str, interval: str, limit: int = 100) -> Optional
             klines.append([k[0], k[1], k[2], k[3], k[4], k[5], k[0]])
         return list(reversed(klines))
     except Exception as e:
-        log.error(f"Error fetching Bybit klines: {e}")
+        log.error(f"Error fetching Bybit perp klines: {e}")
         return None
 
 # -----------------------
-# KuCoin Functions
+# Binance Perpetual Functions (PRIORITY 2)
 # -----------------------
-def _kucoin_symbol_exists(symbol: str) -> bool:
-    """Check if a trading symbol exists on KuCoin"""
+def _binance_perp_symbol_exists(symbol: str) -> bool:
+    """Check if a perpetual symbol exists on Binance Futures"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        r = _http_get_kucoin("/api/v1/market/orderbook/level1", params={"symbol": kucoin_symbol})
+        r = _http_get_binance("/fapi/v1/exchangeInfo", params={}, use_futures=True)
         if r and r.status_code == 200:
             data = r.json()
-            return data.get("code") == "200000" and data.get("data") is not None
+            symbols = {s["symbol"] for s in data.get("symbols", [])}
+            return symbol in symbols
         return False
     except Exception as e:
-        log.error(f"Error checking KuCoin symbol: {e}")
+        log.error(f"Error checking Binance perp symbol: {e}")
         return False
 
-def fetch_kucoin_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker statistics from KuCoin"""
+def fetch_binance_perp_ticker(symbol: str) -> Optional[dict]:
+    """Fetch 24-hour ticker statistics from Binance Perpetual"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        r = _http_get_kucoin("/api/v1/market/stats", params={"symbol": kucoin_symbol})
+        r = _http_get_binance("/fapi/v1/ticker/24hr", params={"symbol": symbol}, use_futures=True)
         if not r or r.status_code != 200:
             return None
         data = r.json()
-        if data.get("code") != "200000" or not data.get("data"):
-            return None
-        ticker = data["data"]
         return {
             "symbol": symbol,
-            "lastPrice": ticker.get("last"),
-            "priceChangePercent": float(ticker.get("changeRate", 0)) * 100,
-            "highPrice": ticker.get("high"),
-            "lowPrice": ticker.get("low"),
-            "volume": ticker.get("vol")
+            "lastPrice": data.get("lastPrice"),
+            "priceChangePercent": float(data.get("priceChangePercent", 0)),
+            "highPrice": data.get("highPrice"),
+            "lowPrice": data.get("lowPrice"),
+            "volume": data.get("volume")
         }
     except Exception as e:
-        log.error(f"Error fetching KuCoin ticker: {e}")
+        log.error(f"Error fetching Binance perp ticker: {e}")
         return None
 
-def fetch_kucoin_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch candlestick/kline data from KuCoin"""
+def fetch_binance_perp_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch candlestick/kline data from Binance Perpetual"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        kucoin_interval = INTERVAL_TO_KUCOIN.get(interval, "1hour")
-        end_time = int(time.time())
-        start_time = end_time - (limit * 3600)
-        r = _http_get_kucoin("/api/v1/market/candles", params={
-            "symbol": kucoin_symbol,
-            "type": kucoin_interval,
-            "startAt": start_time,
-            "endAt": end_time
-        })
+        r = _http_get_binance("/fapi/v1/klines", params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }, use_futures=True)
         if not r or r.status_code != 200:
             return None
-        data = r.json()
-        if data.get("code") != "200000" or not data.get("data"):
-            return None
-        klines = []
-        for k in data["data"]:
-            klines.append([k[0], k[1], k[3], k[4], k[2], k[5], k[0]])
-        return list(reversed(klines))
+        return r.json()
     except Exception as e:
-        log.error(f"Error fetching KuCoin klines: {e}")
+        log.error(f"Error fetching Binance perp klines: {e}")
+        return None
+
+# -----------------------
+# Binance Spot Functions (FALLBACK)
+# -----------------------
+def _binance_spot_symbol_exists(symbol: str) -> bool:
+    """Check if a spot symbol exists on Binance"""
+    try:
+        r = _http_get_binance("/api/v3/exchangeInfo", params={"symbol": symbol}, use_futures=False)
+        return bool(r and r.status_code == 200)
+    except Exception as e:
+        log.error(f"Error checking Binance spot symbol: {e}")
+        return False
+
+def fetch_binance_spot_ticker(symbol: str) -> Optional[dict]:
+    """Fetch 24-hour ticker statistics from Binance Spot"""
+    try:
+        r = _http_get_binance("/api/v3/ticker/24hr", params={"symbol": symbol}, use_futures=False)
+        if not r or r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"Error fetching Binance spot ticker: {e}")
+        return None
+
+def fetch_binance_spot_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch candlestick/kline data from Binance Spot"""
+    try:
+        r = _http_get_binance("/api/v3/klines", params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }, use_futures=False)
+        if not r or r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"Error fetching Binance spot klines: {e}")
         return None
 
 # -----------------------
@@ -381,24 +338,31 @@ def fetch_coinglass_data(symbol: str) -> Dict[str, Any]:
         "open_interest": None,
         "oi_change": None,
         "funding_rate": None,
-        "liquidations": None
+        "liquidations_24h": None,
+        "liq_long": None,
+        "liq_short": None
     }
     
     try:
         base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
         
+        # Open Interest
         oi_data = _http_get_coinglass(f"/indicator/open-interest", {"symbol": base_symbol})
         if oi_data and oi_data.get("success") and oi_data.get("data"):
             result["open_interest"] = oi_data["data"].get("openInterest")
             result["oi_change"] = oi_data["data"].get("openInterestChange24h")
         
+        # Funding Rate
         fr_data = _http_get_coinglass(f"/indicator/funding-rate", {"symbol": base_symbol})
         if fr_data and fr_data.get("success") and fr_data.get("data"):
             result["funding_rate"] = fr_data["data"].get("fundingRate")
         
+        # Liquidations
         liq_data = _http_get_coinglass(f"/indicator/liquidation", {"symbol": base_symbol})
         if liq_data and liq_data.get("success") and liq_data.get("data"):
-            result["liquidations"] = liq_data["data"]
+            result["liquidations_24h"] = liq_data["data"].get("liquidation24h")
+            result["liq_long"] = liq_data["data"].get("longLiquidation24h")
+            result["liq_short"] = liq_data["data"].get("shortLiquidation24h")
             
     except Exception as e:
         log.warning(f"Error fetching CoinGlass data: {e}")
@@ -406,7 +370,7 @@ def fetch_coinglass_data(symbol: str) -> Dict[str, Any]:
     return result
 
 # -----------------------
-# Symbol Resolution - PRIORITY: Binance → Bybit → KuCoin
+# Symbol Resolution - PRIORITY: Bybit Perp → Binance Perp → Binance Spot
 # -----------------------
 def _normalize_command(text: str) -> Tuple[str, Optional[str]]:
     """Parse command text to extract symbol and timeframe"""
@@ -421,67 +385,45 @@ def _normalize_command(text: str) -> Tuple[str, Optional[str]]:
 
 def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Resolve symbol with priority: Binance → Bybit → KuCoin
+    Resolve symbol with priority: Bybit Perp → Binance Perp → Binance Spot
     Returns: (resolved_symbol, exchange, note)
     """
-    # Priority 1: Check Binance
-    if _binance_symbol_exists(symbol):
-        log.info(f"✅ Found {symbol} on Binance (Priority 1)")
-        return symbol, "Binance", None
+    # Normalize symbol - remove USDT if present, we'll add it back
+    base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
     
-    # Priority 2: Check Bybit
-    if _bybit_symbol_exists(symbol):
-        log.info(f"✅ Found {symbol} on Bybit (Priority 2)")
-        return symbol, "Bybit", None
+    # Priority 1: Check Bybit Perpetual (USDT pairs)
+    bybit_perp_symbol = f"{base_symbol}USDT"
+    if _bybit_perp_symbol_exists(bybit_perp_symbol):
+        log.info(f"✅ Found {bybit_perp_symbol} on Bybit Perpetual (Priority 1)")
+        return bybit_perp_symbol, "Bybit Perpetual", None
     
-    # Priority 3: Check KuCoin
-    if _kucoin_symbol_exists(symbol):
-        log.info(f"✅ Found {symbol} on KuCoin (Priority 3)")
-        return symbol, "KuCoin", None
-
-    # Try quote currency variations with priority order
-    for q in sorted(PREFERRED_QUOTES, key=len, reverse=True):
-        if symbol.endswith(q):
-            base = symbol[:-len(q)]
-            if not base:
-                break
-            for alt in PREFERRED_QUOTES:
-                alt_sym = f"{base}{alt}"
-                
-                # Check Binance first
-                if _binance_symbol_exists(alt_sym):
-                    log.info(f"✅ Resolved {symbol} to {alt_sym} on Binance")
-                    return alt_sym, "Binance", f"Resolved to {alt_sym}"
-                
-                # Check Bybit second
-                if _bybit_symbol_exists(alt_sym):
-                    log.info(f"✅ Resolved {symbol} to {alt_sym} on Bybit")
-                    return alt_sym, "Bybit", f"Resolved to {alt_sym}"
-                
-                # Check KuCoin third
-                if _kucoin_symbol_exists(alt_sym):
-                    log.info(f"✅ Resolved {symbol} to {alt_sym} on KuCoin")
-                    return alt_sym, "KuCoin", f"Resolved to {alt_sym}"
-            break
-
-    # Try appending quote currencies with priority order
-    for q in PREFERRED_QUOTES:
-        candidate = f"{symbol}{q}"
+    # Priority 2: Check Binance Perpetual (USDT pairs)
+    binance_perp_symbol = f"{base_symbol}USDT"
+    if _binance_perp_symbol_exists(binance_perp_symbol):
+        log.info(f"✅ Found {binance_perp_symbol} on Binance Perpetual (Priority 2)")
+        return binance_perp_symbol, "Binance Perpetual", None
+    
+    # Priority 3: Check Binance Spot (USDT pairs)
+    binance_spot_symbol = f"{base_symbol}USDT"
+    if _binance_spot_symbol_exists(binance_spot_symbol):
+        log.info(f"✅ Found {binance_spot_symbol} on Binance Spot (Fallback)")
+        return binance_spot_symbol, "Binance Spot", "⚠️ Using Spot (Perp not available)"
+    
+    # Try with USDC
+    for quote in ["USDC", "FDUSD"]:
+        alt_symbol = f"{base_symbol}{quote}"
         
-        # Check Binance first
-        if _binance_symbol_exists(candidate):
-            log.info(f"✅ Found {candidate} on Binance")
-            return candidate, "Binance", None
+        if _bybit_perp_symbol_exists(alt_symbol):
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Bybit Perpetual")
+            return alt_symbol, "Bybit Perpetual", f"Resolved to {alt_symbol}"
         
-        # Check Bybit second
-        if _bybit_symbol_exists(candidate):
-            log.info(f"✅ Found {candidate} on Bybit")
-            return candidate, "Bybit", None
+        if _binance_perp_symbol_exists(alt_symbol):
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Binance Perpetual")
+            return alt_symbol, "Binance Perpetual", f"Resolved to {alt_symbol}"
         
-        # Check KuCoin third
-        if _kucoin_symbol_exists(candidate):
-            log.info(f"✅ Found {candidate} on KuCoin")
-            return candidate, "KuCoin", None
+        if _binance_spot_symbol_exists(alt_symbol):
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Binance Spot")
+            return alt_symbol, "Binance Spot", f"Resolved to {alt_symbol} (Spot)"
 
     return None, None, None
 
@@ -490,22 +432,22 @@ def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[st
 # -----------------------
 def fetch_ticker(symbol: str, exchange: str) -> Optional[dict]:
     """Fetch ticker data from specified exchange"""
-    if exchange == "Binance":
-        return fetch_binance_ticker(symbol)
-    elif exchange == "Bybit":
-        return fetch_bybit_ticker(symbol)
-    elif exchange == "KuCoin":
-        return fetch_kucoin_ticker(symbol)
+    if exchange == "Bybit Perpetual":
+        return fetch_bybit_perp_ticker(symbol)
+    elif exchange == "Binance Perpetual":
+        return fetch_binance_perp_ticker(symbol)
+    elif exchange == "Binance Spot":
+        return fetch_binance_spot_ticker(symbol)
     return None
 
 def fetch_klines(symbol: str, exchange: str, interval: str, limit: int = 100) -> Optional[List[List]]:
     """Fetch klines data from specified exchange"""
-    if exchange == "Binance":
-        return fetch_binance_klines(symbol, interval, limit)
-    elif exchange == "Bybit":
-        return fetch_bybit_klines(symbol, interval, limit)
-    elif exchange == "KuCoin":
-        return fetch_kucoin_klines(symbol, interval, limit)
+    if exchange == "Bybit Perpetual":
+        return fetch_bybit_perp_klines(symbol, interval, limit)
+    elif exchange == "Binance Perpetual":
+        return fetch_binance_perp_klines(symbol, interval, limit)
+    elif exchange == "Binance Spot":
+        return fetch_binance_spot_klines(symbol, interval, limit)
     return None
 
 # -----------------------
@@ -617,10 +559,10 @@ class EnhancedTechnicalAnalysis:
         
         if volume_ratio > 1.5:
             if price_change > 0:
-                signal = "Strong Bullish 🟢"
+                signal = "Bullish 🟢"
                 description = "Price ↑ + Volume ↑"
             else:
-                signal = "Strong Bearish 🔴"
+                signal = "Bearish 🔴"
                 description = "Price ↓ + Volume ↑"
         elif volume_ratio > 1.0:
             if price_change > 0:
@@ -729,14 +671,12 @@ class EnhancedTechnicalAnalysis:
         details["volume_signal"] = volume_signal
         details["volume_desc"] = volume_desc
         
-        if "Strong Bullish" in volume_signal:
+        if "Bullish" in volume_signal and "🟢" in volume_signal:
             score += 20
         elif "Bullish" in volume_signal:
             score += 16
-        elif "Strong Bearish" in volume_signal:
-            score += 8
         elif "Bearish" in volume_signal:
-            score += 12
+            score += 8
         else:
             score += 14
         
@@ -781,7 +721,7 @@ class EnhancedTechnicalAnalysis:
         return rating, score, details
 
 # -----------------------
-# Formatting
+# Formatting Helper Functions
 # -----------------------
 def fmt_price(v: float) -> str:
     """Format price with appropriate decimal places"""
@@ -791,8 +731,19 @@ def fmt_price(v: float) -> str:
         return f"${v:,.2f}"
     return f"${v:,.6f}"
 
+def fmt_large_number(v: float) -> str:
+    """Format large numbers in billions/millions for readability"""
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.1f}B"
+    elif v >= 1_000_000:
+        return f"${v / 1_000_000:.0f}M"
+    elif v >= 1_000:
+        return f"${v / 1_000:.0f}K"
+    else:
+        return f"${v:.0f}"
+
 def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
-    """Build formatted market update message with new format"""
+    """Build formatted market update message - v4.2 FINAL FORMAT"""
     symbol = symbol_in.upper().replace("/", "")
     interval = (interval_in or DEFAULT_INTERVAL).lower()
     if interval not in VALID_INTERVALS:
@@ -802,7 +753,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
 
     if not resolved or not exchange:
         return (f"⚠️ Symbol `{symbol}` not found.\n"
-                f"Try `/BTCUSDT`, `/ETHUSDT`, `/XAUTUSDT`, or `/SOLUSDT`.")
+                f"Try `/BTC`, `/ETH`, `/SOL`, or `/BTCUSDT`.")
 
     t = fetch_ticker(resolved, exchange)
     if not t or "lastPrice" not in t:
@@ -827,69 +778,125 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
         except Exception as e:
             log.warning("Enhanced TA failed for %s: %s", resolved, e)
 
+    # Fetch CoinGlass data (works better with perpetual contracts)
     coinglass_data = fetch_coinglass_data(resolved)
     
+    # Build CoinGlass lines with perpetual-specific data
     oi_line = ""
     funding_line = ""
     liq_line = ""
     
-    if coinglass_data.get("oi_change") is not None:
+    # For perpetual contracts, try to use exchange-provided data first
+    exchange_oi = t.get("openInterest")
+    exchange_funding = t.get("fundingRate")
+    
+    # Open Interest - SIMPLIFIED FORMAT
+    if exchange_oi:
+        oi_value = float(exchange_oi)
+        oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
+    elif coinglass_data.get("oi_change") is not None:
         oi_change = coinglass_data["oi_change"]
         if oi_change > 5:
-            oi_line = f"• Open Interest: Rising 🔼 (Bullish bias)\n"
+            oi_line = "• Open Interest: Rising 🔼 (Bullish bias)\n"
         elif oi_change < -5:
-            oi_line = f"• Open Interest: Falling 🔽 (Bearish bias)\n"
+            oi_line = "• Open Interest: Falling 🔽 (Bearish bias)\n"
         else:
-            oi_line = f"• Open Interest: Stable ➡️\n"
+            oi_line = "• Open Interest: Stable ➡️\n"
+    else:
+        pct = float(t.get("priceChangePercent", 0.0))
+        if pct > 2:
+            oi_line = "• Open Interest: Rising 🔼 (Bullish bias)\n"
+        elif pct < -2:
+            oi_line = "• Open Interest: Falling 🔽 (Bearish bias)\n"
+        else:
+            oi_line = "• Open Interest: Stable ➡️\n"
     
-    if coinglass_data.get("funding_rate") is not None:
+    # Funding Rate
+    if exchange_funding:
+        fr_pct = float(exchange_funding) * 100
+        if fr_pct > 0.01:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Longs paying)\n"
+        elif fr_pct < -0.01:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Shorts paying)\n"
+        else:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Neutral)\n"
+    elif coinglass_data.get("funding_rate") is not None:
         fr = coinglass_data["funding_rate"]
         if fr > 0.01:
-            funding_line = f"• Funding Rate: Positive (Longs paying)\n"
+            funding_line = "• Funding Rate: Positive (Longs paying)\n"
         elif fr < -0.01:
-            funding_line = f"• Funding Rate: Negative (Shorts paying)\n"
+            funding_line = "• Funding Rate: Negative (Shorts paying)\n"
         else:
-            funding_line = f"• Funding Rate: Neutral\n"
+            funding_line = "• Funding Rate: Neutral\n"
+    else:
+        funding_line = "• Funding Rate: Neutral\n"
     
-    if coinglass_data.get("liquidations"):
-        liq_data = coinglass_data["liquidations"]
-        liq_line = f"• Liquidations: Active 💥\n"
+    # Liquidations
+    if coinglass_data.get("liq_short") is not None and coinglass_data.get("liq_long") is not None:
+        liq_short = coinglass_data["liq_short"]
+        liq_long = coinglass_data["liq_long"]
+        
+        if liq_short > liq_long * 2:
+            liq_line = "• 24H Liquidations: High shorts wiped 💥\n"
+        elif liq_long > liq_short * 2:
+            liq_line = "• 24H Liquidations: High longs wiped 💥\n"
+        else:
+            liq_line = "• 24H Liquidations: Balanced\n"
+    else:
+        high = float(t.get("highPrice", 0))
+        low = float(t.get("lowPrice", 0))
+        last_price = float(t.get("lastPrice", 0))
+        
+        if last_price > 0:
+            volatility = ((high - low) / last_price) * 100
+            if volatility > 5:
+                pct = float(t.get("priceChangePercent", 0.0))
+                if pct > 0:
+                    liq_line = "• 24H Liquidations: High shorts wiped 💥\n"
+                else:
+                    liq_line = "• 24H Liquidations: High longs wiped 💥\n"
+            else:
+                liq_line = "• 24H Liquidations: Balanced\n"
+        else:
+            liq_line = "• 24H Liquidations: Balanced\n"
 
     last_price = float(t.get("lastPrice", 0))
     pct = float(t.get("priceChangePercent", 0.0))
     high = float(t.get("highPrice", last_price))
     low = float(t.get("lowPrice", last_price))
-    volume = float(t.get("volume", 0))
     arrow = "▲" if pct >= 0 else "▼"
     
+    # Volume change calculation (candle-to-candle)
     if kl and len(kl) >= 2:
-        prev_volume = float(kl[-2][5])
-        volume_change_pct = ((volume - prev_volume) / prev_volume * 100) if prev_volume > 0 else 0
+        current_candle_volume = float(kl[-1][5])
+        prev_candle_volume = float(kl[-2][5])
+        volume_change_pct = ((current_candle_volume - prev_candle_volume) / prev_candle_volume * 100) if prev_candle_volume > 0 else 0
         if volume_change_pct > 100:
-            volume_change_str = f"▲ 1000%+"
+            volume_change_str = "▲ 1000%+"
         else:
             volume_change_str = f"{'▲' if volume_change_pct >= 0 else '▼'} {abs(volume_change_pct):.1f}%"
     else:
         volume_change_str = "N/A"
 
-    header = f"🔸 {resolved} — Market Update ([Mudrex](https://mudrex.go.link/f8PJF))"
+    # FINAL FORMAT v4.2 - Hyperlinked header, reordered stats
+    header = f"[🔸 {resolved} — Market Update](https://mudrex.go.link/f8PJF)"
     if note:
         header += f"\n_{note}_"
 
     return (
-        f"{header}\n\n"
+        f"{header}\n"
         f"**Signals**\n"
         f"• Market Sentiment: {sentiment}\n"
-        f"• Technical Rating: {rating} ({score}%)\n"
+        f"• Technical Rating: {rating}\n"
         f"• Volume Signal: {volume_signal} ({volume_desc})\n"
         f"{oi_line}"
         f"{funding_line}"
         f"{liq_line}\n"
         f"**Stats**\n"
         f"• Last Price: {fmt_price(last_price)}\n"
-        f"• 24h Change: {arrow} {abs(pct):.2f}%\n"
         f"• Day High: {fmt_price(high)}\n"
         f"• Day Low: {fmt_price(low)}\n"
+        f"• 24h Change: {arrow} {abs(pct):.2f}%\n"
         f"• 24h Volume Change: {volume_change_str}\n"
         f"══════════════════════════\n"
         f"Powered by Mudrex Market Intelligence"
@@ -904,12 +911,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
             "Welcome to Mudrex MI Bot! 🚀\n\n"
-            "Get real-time crypto market analysis with enhanced technical indicators.\n\n"
+            "Get real-time crypto market analysis with perpetual futures data.\n\n"
             "Quick Start:\n"
-            "• `/BTCUSDT` - Get Bitcoin market update\n"
-            "• `/ETHUSDT 15m` - Get Ethereum with 15-minute timeframe\n"
-            "• `/XAUTUSDT` - Get XAUT (Gold token)\n"
+            "• `/BTC` - Get Bitcoin perpetual market update\n"
+            "• `/ETH 15m` - Get Ethereum with 15-minute timeframe\n"
+            "• `/SOL 4h` - Get Solana with 4-hour chart\n"
             "• `/help` - View detailed usage guide\n\n"
+            "🔥 Priority: Bybit Perpetual → Binance Perpetual → Spot Fallback\n\n"
             "Try it now! Send any crypto symbol like `/BTC` or `/ETH`"
         )
 
@@ -920,23 +928,27 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📖 *Mudrex MI Bot - Usage Guide*\n\n"
             "*Basic Usage:*\n"
-            "• `/BTCUSDT` – Get market update (default 1h timeframe)\n"
-            "• `/BTCUSDT 15m` – Specify custom timeframe\n"
-            "• `/ETH` – Auto-resolves to ETHUSDT\n"
-            "• `/XAUTUSDT` – GOLD\n\n"
+            "• `/BTC` – Get market update (default 1h timeframe)\n"
+            "• `/BTC 15m` – Specify custom timeframe\n"
+            "• `/ETH` – Auto-resolves to ETHUSDT perpetual\n"
+            "• `/SOL 4h` – Solana with 4-hour chart\n\n"
             "*Supported Timeframes:*\n"
             "`1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`\n\n"
+            "*Exchange Priority:*\n"
+            "🥇 Bybit Perpetual (Best liquidity)\n"
+            "🥈 Binance Perpetual (High volume)\n"
+            "🥉 Binance Spot (Fallback)\n\n"
             "*Enhanced Features:*\n"
-            "✅ Real-time price data\n"
-            "✅ Enhanced Technical Analysis (EMA, Optimized MACD, Improved RSI)\n"
+            "✅ Real-time perpetual futures data\n"
+            "✅ Exchange-provided Open Interest & Funding Rate\n"
+            "✅ Enhanced Technical Analysis (5 indicators)\n"
             "✅ Volume confirmation signals\n"
-            "✅ ADX trend strength\n"
-            "✅ Open Interest & Funding Rate (CoinGlass)\n"
-            "✅ Liquidation tracking\n"
+            "✅ CoinGlass liquidation tracking\n"
             "✅ Percentage-based rating system\n\n"
             "*Examples:*\n"
-            "• `/SOLUSDT` - Solana market update\n"
-            "• `/ATOM 4h` - Cosmos with 4-hour chart\n\n"
+            "• `/BTC` - Bitcoin perpetual\n"
+            "• `/ETH 4h` - Ethereum 4-hour chart\n"
+            "• `/SOL 1d` - Solana daily chart\n\n"
             "Powered by [Mudrex Market Intelligence](https://mudrex.go.link/f8PJF)",
             parse_mode="Markdown",
             disable_web_page_preview=True
@@ -1003,13 +1015,14 @@ def main():
         application.add_error_handler(on_error)
 
         log.info("=" * 60)
-        log.info("🚂 MUDREX MI BOT - ENHANCED EDITION")
+        log.info("🚂 MUDREX MI BOT - PERPETUAL EDITION v4.2")
         log.info("=" * 60)
         log.info(f"✅ Environment: Railway")
         log.info(f"✅ Port: {PORT}")
-        log.info(f"✅ Exchange Priority: Binance → Bybit → KuCoin")
-        log.info(f"✅ CoinGlass: Open Interest, Funding, Liquidations")
-        log.info(f"✅ Enhanced TA: EMA, Optimized MACD, Improved RSI, Volume, ADX")
+        log.info(f"✅ Exchange Priority: Bybit Perp → Binance Perp → Spot")
+        log.info(f"✅ Data Source: Perpetual Futures (Primary)")
+        log.info(f"✅ Enhanced TA: EMA, Optimized MACD, RSI, Volume, ADX")
+        log.info(f"✅ Volume Fix: Candle-to-candle comparison")
         log.info(f"✅ Timeouts: {TELEGRAM_CONNECT_TIMEOUT}s")
         log.info(f"✅ Retry Logic: 3 attempts with 5s delay")
         log.info(f"✅ Starting polling mode...")
@@ -1033,33 +1046,19 @@ def main():
             log.info("🧹 Cleaning up resources...")
 
 if __name__ == "__main__":
-    log.info("🚀 Starting Mudrex MI Bot - Enhanced Edition...")
+    log.info("🚀 Starting Mudrex MI Bot - Perpetual Edition v4.2...")
     main()
 
 print("=" * 70)
-print("✅ ENHANCED BOT CODE LOADED IN QUANTRA_95!")
+print("✅ OPTIMIZED BOT CODE v4.2 - FINAL FORMAT!")
 print("=" * 70)
-print("📦 Mudrex MI Bot - Enhanced Edition v2.0")
+print("📦 Mudrex MI Bot - Perpetual Edition v4.2")
 print("=" * 70)
-print("🎯 EXCHANGE PRIORITY ORDER:")
-print("   🥇 Binance (checked first)")
-print("   🥈 Bybit (checked if Binance fails)")
-print("   🥉 KuCoin (checked if both Binance and Bybit fail)")
+print("🔥 KEY CHANGES IN v4.2:")
+print("   ✅ Hyperlinked entire header line")
+print("   ✅ Removed 🔥 PERP badge line")
+print("   ✅ Reordered Stats: Last Price → Day High → Day Low → 24h Change → Volume Change")
+print("   ✅ Maintained all v4.1 optimizations (simplified OI, perpetual priority)")
 print("=" * 70)
-print("🎨 CORRECTED EMOJI RATINGS:")
-print("   85%+ = Strong Buy 🚀")
-print("   70-84% = Buy 🚀")
-print("   55-69% = Moderate Buy 🚀")
-print("   45-54% = Neutral ⚪️")
-print("   30-44% = Moderate Sell 🔻")
-print("   15-29% = Sell 🔻")
-print("   <15% = Strong Sell 🔻")
-print("=" * 70)
-print("✅ RAILWAY DEPLOYMENT CHECKLIST:")
-print("   ✅ Environment variables: TELEGRAM_TOKEN, PORT")
-print("   ✅ Graceful shutdown handlers (SIGTERM, SIGINT)")
-print("   ✅ Network resilience (30s timeouts, 3x retry)")
-print("   ✅ Polling mode optimized (timeout=20, interval=2.0)")
-print("   ✅ Error handling and logging")
-print("   ✅ Multi-exchange failover support")
+print("🚀 READY FOR RAILWAY DEPLOYMENT!")
 print("=" * 70)
