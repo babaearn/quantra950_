@@ -1,9 +1,3 @@
-# ============================================================================
-# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY
-# ============================================================================
-# Priority: Bybit Perpetual → Binance Perpetual → Spot Fallback
-# ============================================================================
-
 import os
 import time
 import logging
@@ -89,6 +83,18 @@ DEFAULT_INTERVAL = "1h"
 
 # Global application instance
 application = None
+
+# -----------------------
+# Safe Type Conversion Helper
+# -----------------------
+def safe_float(x, default=0.0) -> float:
+    """Safely convert value to float with fallback"""
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except (ValueError, TypeError):
+        return default
 
 # -----------------------
 # Retry Decorator for Network Resilience
@@ -188,7 +194,8 @@ def _bybit_perp_symbol_exists(symbol: str) -> bool:
         r = _http_get_bybit("/v5/market/tickers", params={"category": "linear", "symbol": symbol})
         if r and r.status_code == 200:
             data = r.json()
-            return data.get("retCode") == 0 and data.get("result", {}).get("list")
+            result_list = data.get("result", {}).get("list")
+            return bool(data.get("retCode") == 0 and result_list)
         return False
     except Exception as e:
         log.error(f"Error checking Bybit perp symbol: {e}")
@@ -207,7 +214,7 @@ def fetch_bybit_perp_ticker(symbol: str) -> Optional[dict]:
         return {
             "symbol": symbol,
             "lastPrice": ticker.get("lastPrice"),
-            "priceChangePercent": float(ticker.get("price24hPcnt", 0)) * 100,
+            "priceChangePercent": safe_float(ticker.get("price24hPcnt", 0)) * 100,
             "highPrice": ticker.get("highPrice24h"),
             "lowPrice": ticker.get("lowPrice24h"),
             "volume": ticker.get("volume24h"),
@@ -235,7 +242,8 @@ def fetch_bybit_perp_klines(symbol: str, interval: str, limit: int = 100) -> Opt
             return None
         klines = []
         for k in data["result"]["list"]:
-            klines.append([k[0], k[1], k[2], k[3], k[4], k[5], k[0]])
+            if len(k) >= 6:  # Validate length before indexing
+                klines.append([k[0], k[1], k[2], k[3], k[4], k[5], k[0]])
         return list(reversed(klines))
     except Exception as e:
         log.error(f"Error fetching Bybit perp klines: {e}")
@@ -267,7 +275,7 @@ def fetch_binance_perp_ticker(symbol: str) -> Optional[dict]:
         return {
             "symbol": symbol,
             "lastPrice": data.get("lastPrice"),
-            "priceChangePercent": float(data.get("priceChangePercent", 0)),
+            "priceChangePercent": safe_float(data.get("priceChangePercent", 0)),
             "highPrice": data.get("highPrice"),
             "lowPrice": data.get("lowPrice"),
             "volume": data.get("volume")
@@ -379,6 +387,8 @@ def _normalize_command(text: str) -> Tuple[str, Optional[str]]:
         s = s[1:]
     s = s.split("@")[0]
     parts = s.split()
+    if not parts or not parts[0]:
+        return "", None
     symbol = parts[0].upper().replace("/", "")
     tf = parts[1].lower() if len(parts) > 1 else None
     return symbol, tf
@@ -388,6 +398,9 @@ def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[st
     Resolve symbol with priority: Bybit Perp → Binance Perp → Binance Spot
     Returns: (resolved_symbol, exchange, note)
     """
+    if not symbol:
+        return None, None, None
+        
     # Normalize symbol - remove USDT if present, we'll add it back
     base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
     
@@ -407,7 +420,7 @@ def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[st
     binance_spot_symbol = f"{base_symbol}USDT"
     if _binance_spot_symbol_exists(binance_spot_symbol):
         log.info(f"✅ Found {binance_spot_symbol} on Binance Spot (Fallback)")
-        return binance_spot_symbol, "Binance Spot", "⚠️ Using Spot (Perp not available)"
+        return binance_spot_symbol, "Binance Spot", "Using Spot (Perp not available)"
     
     # Try with USDC
     for quote in ["USDC", "FDUSD"]:
@@ -460,11 +473,11 @@ class EnhancedTechnicalAnalysis:
         if len(klines) < 50:
             raise ValueError("Need at least 50 candles for accurate analysis")
         
-        self.closes = np.array([float(k[4]) for k in klines], dtype=float)
-        self.highs = np.array([float(k[2]) for k in klines], dtype=float)
-        self.lows = np.array([float(k[3]) for k in klines], dtype=float)
-        self.volumes = np.array([float(k[5]) for k in klines], dtype=float)
-        self.opens = np.array([float(k[1]) for k in klines], dtype=float)
+        self.closes = np.array([safe_float(k[4]) for k in klines], dtype=float)
+        self.highs = np.array([safe_float(k[2]) for k in klines], dtype=float)
+        self.lows = np.array([safe_float(k[3]) for k in klines], dtype=float)
+        self.volumes = np.array([safe_float(k[5]) for k in klines], dtype=float)
+        self.opens = np.array([safe_float(k[1]) for k in klines], dtype=float)
 
     def _ema(self, data: np.ndarray, period: int) -> np.ndarray:
         """Calculate Exponential Moving Average"""
@@ -481,6 +494,7 @@ class EnhancedTechnicalAnalysis:
         gains = np.where(delta > 0, delta, 0.0)
         losses = np.where(delta < 0, -delta, 0.0)
         
+        # Wilder's smoothing
         avg_gain = np.zeros(len(gains))
         avg_loss = np.zeros(len(losses))
         avg_gain[period-1] = np.mean(gains[:period])
@@ -493,6 +507,7 @@ class EnhancedTechnicalAnalysis:
         rs = avg_gain[-1] / avg_loss[-1] if avg_loss[-1] != 0 else 100
         rsi_value = 100 - (100 / (1 + rs))
         
+        # RSI slope analysis
         if len(self.closes) >= period + 5:
             rsi_prev = 100 - (100 / (1 + (avg_gain[-5] / avg_loss[-5]))) if avg_loss[-5] != 0 else 100
             rsi_slope = "Rising" if rsi_value > rsi_prev else "Falling"
@@ -511,12 +526,17 @@ class EnhancedTechnicalAnalysis:
         signal_val = round(signal_line[-1], 6)
         hist_val = round(histogram[-1], 6)
         
-        if macd_val > signal_val:
-            trend = "Bullish"
-            strength = "Strong" if hist_val > histogram[-2] else "Weak"
+        # Determine trend and strength
+        if len(histogram) >= 2:
+            if macd_val > signal_val:
+                trend = "Bullish"
+                strength = "Strong" if hist_val > histogram[-2] else "Weak"
+            else:
+                trend = "Bearish"
+                strength = "Strong" if hist_val < histogram[-2] else "Weak"
         else:
-            trend = "Bearish"
-            strength = "Strong" if hist_val < histogram[-2] else "Weak"
+            trend = "Neutral"
+            strength = "Weak"
         
         return macd_val, signal_val, hist_val, trend, strength
 
@@ -528,7 +548,7 @@ class EnhancedTechnicalAnalysis:
         current_fast = ema_fast[-1]
         current_slow = ema_slow[-1]
         
-        distance_pct = ((current_fast - current_slow) / current_slow) * 100
+        distance_pct = ((current_fast - current_slow) / current_slow) * 100 if current_slow != 0 else 0
         
         if current_fast > current_slow:
             if distance_pct > 2:
@@ -593,10 +613,10 @@ class EnhancedTechnicalAnalysis:
             )
         )
         
-        atr = np.mean(tr[-period:])
+        atr = np.mean(tr[-period:]) if len(tr) >= period else np.mean(tr)
         
-        plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr > 0 else 0
-        minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr > 0 else 0
+        plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr > 0 and len(plus_dm) >= period else 0
+        minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr > 0 and len(minus_dm) >= period else 0
         
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 0
         
@@ -743,7 +763,7 @@ def fmt_large_number(v: float) -> str:
         return f"${v:.0f}"
 
 def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
-    """Build formatted market update message - v4.2 FINAL FORMAT"""
+    """Build formatted market update message - v4.3 PRODUCTION-READY"""
     symbol = symbol_in.upper().replace("/", "")
     interval = (interval_in or DEFAULT_INTERVAL).lower()
     if interval not in VALID_INTERVALS:
@@ -752,12 +772,12 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     resolved, exchange, note = _resolve_symbol_or_fallback(symbol)
 
     if not resolved or not exchange:
-        return (f"⚠️ Symbol `{symbol}` not found.\n"
-                f"Try `/BTC`, `/ETH`, `/SOL`, or `/BTCUSDT`.")
+        return (f"Symbol {symbol} not found.\n"
+                f"Try /BTC, /ETH, /SOL, or /BTCUSDT.")
 
     t = fetch_ticker(resolved, exchange)
     if not t or "lastPrice" not in t:
-        return f"⚠️ Could not fetch 24h stats for `{resolved}` from {exchange}. Try again later."
+        return f"Could not fetch 24h stats for {resolved} from {exchange}. Try again later."
 
     kl = fetch_klines(resolved, exchange, interval=interval, limit=100)
 
@@ -792,28 +812,28 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     
     # Open Interest - SIMPLIFIED FORMAT
     if exchange_oi:
-        oi_value = float(exchange_oi)
+        oi_value = safe_float(exchange_oi)
         oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
     elif coinglass_data.get("oi_change") is not None:
-        oi_change = coinglass_data["oi_change"]
+        oi_change = safe_float(coinglass_data["oi_change"])
         if oi_change > 5:
-            oi_line = "• Open Interest: Rising 🔼 (Bullish bias)\n"
+            oi_line = "• Open Interest: Rising (Bullish bias)\n"
         elif oi_change < -5:
-            oi_line = "• Open Interest: Falling 🔽 (Bearish bias)\n"
+            oi_line = "• Open Interest: Falling (Bearish bias)\n"
         else:
-            oi_line = "• Open Interest: Stable ➡️\n"
+            oi_line = "• Open Interest: Stable\n"
     else:
-        pct = float(t.get("priceChangePercent", 0.0))
+        pct = safe_float(t.get("priceChangePercent", 0.0))
         if pct > 2:
-            oi_line = "• Open Interest: Rising 🔼 (Bullish bias)\n"
+            oi_line = "• Open Interest: Rising (Bullish bias)\n"
         elif pct < -2:
-            oi_line = "• Open Interest: Falling 🔽 (Bearish bias)\n"
+            oi_line = "• Open Interest: Falling (Bearish bias)\n"
         else:
-            oi_line = "• Open Interest: Stable ➡️\n"
+            oi_line = "• Open Interest: Stable\n"
     
     # Funding Rate
     if exchange_funding:
-        fr_pct = float(exchange_funding) * 100
+        fr_pct = safe_float(exchange_funding) * 100
         if fr_pct > 0.01:
             funding_line = f"• Funding Rate: {fr_pct:.4f}% (Longs paying)\n"
         elif fr_pct < -0.01:
@@ -821,7 +841,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
         else:
             funding_line = f"• Funding Rate: {fr_pct:.4f}% (Neutral)\n"
     elif coinglass_data.get("funding_rate") is not None:
-        fr = coinglass_data["funding_rate"]
+        fr = safe_float(coinglass_data["funding_rate"])
         if fr > 0.01:
             funding_line = "• Funding Rate: Positive (Longs paying)\n"
         elif fr < -0.01:
@@ -833,58 +853,62 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     
     # Liquidations
     if coinglass_data.get("liq_short") is not None and coinglass_data.get("liq_long") is not None:
-        liq_short = coinglass_data["liq_short"]
-        liq_long = coinglass_data["liq_long"]
+        liq_short = safe_float(coinglass_data["liq_short"])
+        liq_long = safe_float(coinglass_data["liq_long"])
         
         if liq_short > liq_long * 2:
-            liq_line = "• 24H Liquidations: High shorts wiped 💥\n"
+            liq_line = "• 24H Liquidations: High shorts wiped\n"
         elif liq_long > liq_short * 2:
-            liq_line = "• 24H Liquidations: High longs wiped 💥\n"
+            liq_line = "• 24H Liquidations: High longs wiped\n"
         else:
             liq_line = "• 24H Liquidations: Balanced\n"
     else:
-        high = float(t.get("highPrice", 0))
-        low = float(t.get("lowPrice", 0))
-        last_price = float(t.get("lastPrice", 0))
+        high = safe_float(t.get("highPrice", 0))
+        low = safe_float(t.get("lowPrice", 0))
+        last_price = safe_float(t.get("lastPrice", 0))
         
         if last_price > 0:
             volatility = ((high - low) / last_price) * 100
             if volatility > 5:
-                pct = float(t.get("priceChangePercent", 0.0))
+                pct = safe_float(t.get("priceChangePercent", 0.0))
                 if pct > 0:
-                    liq_line = "• 24H Liquidations: High shorts wiped 💥\n"
+                    liq_line = "• 24H Liquidations: High shorts wiped\n"
                 else:
-                    liq_line = "• 24H Liquidations: High longs wiped 💥\n"
+                    liq_line = "• 24H Liquidations: High longs wiped\n"
             else:
                 liq_line = "• 24H Liquidations: Balanced\n"
         else:
             liq_line = "• 24H Liquidations: Balanced\n"
 
-    last_price = float(t.get("lastPrice", 0))
-    pct = float(t.get("priceChangePercent", 0.0))
-    high = float(t.get("highPrice", last_price))
-    low = float(t.get("lowPrice", last_price))
+    last_price = safe_float(t.get("lastPrice", 0))
+    pct = safe_float(t.get("priceChangePercent", 0.0))
+    high = safe_float(t.get("highPrice", last_price))
+    low = safe_float(t.get("lowPrice", last_price))
     arrow = "▲" if pct >= 0 else "▼"
     
-    # Volume change calculation (candle-to-candle)
+    # Volume change calculation (candle-to-candle) - FIXED THRESHOLD
     if kl and len(kl) >= 2:
-        current_candle_volume = float(kl[-1][5])
-        prev_candle_volume = float(kl[-2][5])
+        current_candle_volume = safe_float(kl[-1][5])
+        prev_candle_volume = safe_float(kl[-2][5])
         volume_change_pct = ((current_candle_volume - prev_candle_volume) / prev_candle_volume * 100) if prev_candle_volume > 0 else 0
-        if volume_change_pct > 100:
+        
+        # FIXED: Proper threshold logic
+        if volume_change_pct > 1000:
             volume_change_str = "▲ 1000%+"
+        elif volume_change_pct < -1000:
+            volume_change_str = "▼ 1000%+"
         else:
             volume_change_str = f"{'▲' if volume_change_pct >= 0 else '▼'} {abs(volume_change_pct):.1f}%"
     else:
         volume_change_str = "N/A"
 
-    # FINAL FORMAT v4.2 - Hyperlinked header, reordered stats
-    header = f"[🔸 {resolved} — Market Update](https://mudrex.go.link/f8PJF)"
+    # Build message WITHOUT Markdown formatting to avoid parse errors
+    header = f"🔸 {resolved} — Market Update (https://mudrex.go.link/f8PJF)"
     if note:
-        header += f"\n_{note}_"
+        header += f"\n{note}"
 
     return (
-        f"{header}\n"
+        f"{header}\n\n"
         f"**Signals**\n"
         f"• Market Sentiment: {sentiment}\n"
         f"• Technical Rating: {rating}\n"
@@ -903,7 +927,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     )
 
 # -----------------------
-# Telegram Handlers with Retry Logic
+# Telegram Handlers with Retry Logic - FIXED TO RUN IN EXECUTOR
 # -----------------------
 @retry_on_telegram_error(max_retries=3, delay=5)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -913,12 +937,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Welcome to Mudrex MI Bot! 🚀\n\n"
             "Get real-time crypto market analysis with perpetual futures data.\n\n"
             "Quick Start:\n"
-            "• `/BTC` - Get Bitcoin perpetual market update\n"
-            "• `/ETH 15m` - Get Ethereum with 15-minute timeframe\n"
-            "• `/SOL 4h` - Get Solana with 4-hour chart\n"
-            "• `/help` - View detailed usage guide\n\n"
-            "🔥 Priority: Bybit Perpetual → Binance Perpetual → Spot Fallback\n\n"
-            "Try it now! Send any crypto symbol like `/BTC` or `/ETH`"
+            "• /BTC - Get Bitcoin perpetual market update\n"
+            "• /ETH 15m - Get Ethereum with 15-minute timeframe\n"
+            "• /SOL 4h - Get Solana with 4-hour chart\n"
+            "• /help - View detailed usage guide\n\n"
+            "Priority: Bybit Perpetual → Binance Perpetual → Spot Fallback\n\n"
+            "Try it now! Send any crypto symbol like /BTC or /ETH",
+            disable_web_page_preview=True
         )
 
 @retry_on_telegram_error(max_retries=3, delay=5)
@@ -926,43 +951,57 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     if update.message:
         await update.message.reply_text(
-            "📖 *Mudrex MI Bot - Usage Guide*\n\n"
-            "*Basic Usage:*\n"
-            "• `/BTC` – Get market update (default 1h timeframe)\n"
-            "• `/BTC 15m` – Specify custom timeframe\n"
-            "• `/ETH` – Auto-resolves to ETHUSDT perpetual\n"
-            "• `/SOL 4h` – Solana with 4-hour chart\n\n"
-            "*Supported Timeframes:*\n"
-            "`1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`\n\n"
-            "*Exchange Priority:*\n"
-            "🥇 Bybit Perpetual (Best liquidity)\n"
-            "🥈 Binance Perpetual (High volume)\n"
-            "🥉 Binance Spot (Fallback)\n\n"
-            "*Enhanced Features:*\n"
+            "Mudrex MI Bot - Usage Guide\n\n"
+            "Basic Usage:\n"
+            "• /BTC – Get market update (default 1h timeframe)\n"
+            "• /BTC 15m – Specify custom timeframe\n"
+            "• /ETH – Auto-resolves to ETHUSDT perpetual\n"
+            "• /SOL 4h – Solana with 4-hour chart\n\n"
+            "Supported Timeframes:\n"
+            "1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w\n\n"
+            "Exchange Priority:\n"
+            "1. Bybit Perpetual (Best liquidity)\n"
+            "2. Binance Perpetual (High volume)\n"
+            "3. Binance Spot (Fallback)\n\n"
+            "Enhanced Features:\n"
             "✅ Real-time perpetual futures data\n"
             "✅ Exchange-provided Open Interest & Funding Rate\n"
             "✅ Enhanced Technical Analysis (5 indicators)\n"
             "✅ Volume confirmation signals\n"
             "✅ CoinGlass liquidation tracking\n"
             "✅ Percentage-based rating system\n\n"
-            "*Examples:*\n"
-            "• `/BTC` - Bitcoin perpetual\n"
-            "• `/ETH 4h` - Ethereum 4-hour chart\n"
-            "• `/SOL 1d` - Solana daily chart\n\n"
-            "Powered by [Mudrex Market Intelligence](https://mudrex.go.link/f8PJF)",
-            parse_mode="Markdown",
+            "Examples:\n"
+            "• /BTC - Bitcoin perpetual\n"
+            "• /ETH 4h - Ethereum 4-hour chart\n"
+            "• /SOL 1d - Solana daily chart\n\n"
+            "Powered by Mudrex Market Intelligence\n"
+            "https://mudrex.go.link/f8PJF",
             disable_web_page_preview=True
         )
 
 @retry_on_telegram_error(max_retries=3, delay=5)
 async def any_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle any symbol command"""
+    """Handle any symbol command - FIXED: Run blocking code in executor"""
     if not update.message:
         return
+    
     text = update.message.text or ""
     symbol, tf = _normalize_command(text)
-    msg = build_update(symbol, tf)
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    
+    # Validate empty symbol
+    if not symbol:
+        await update.message.reply_text(
+            "Please provide a symbol. Examples: /BTC, /ETH, /SOL",
+            disable_web_page_preview=True
+        )
+        return
+    
+    # Run blocking, network-heavy build_update in executor to avoid blocking event loop
+    loop = asyncio.get_running_loop()
+    msg = await loop.run_in_executor(None, build_update, symbol, tf)
+    
+    # Send without Markdown parsing to avoid parse errors
+    await update.message.reply_text(msg, parse_mode=None, disable_web_page_preview=True)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
@@ -977,7 +1016,9 @@ def signal_handler(signum, frame):
     log.info(f"🛑 Received signal {signum}. Shutting down gracefully...")
     if application:
         try:
-            application.stop()
+            # For PTB v20, use shutdown() instead of stop()
+            if hasattr(application, 'shutdown'):
+                asyncio.run(application.shutdown())
             log.info("✅ Bot stopped successfully")
         except Exception as e:
             log.error(f"Error during shutdown: {e}")
@@ -1015,7 +1056,7 @@ def main():
         application.add_error_handler(on_error)
 
         log.info("=" * 60)
-        log.info("🚂 MUDREX MI BOT - PERPETUAL EDITION v4.2")
+        log.info("🚂 MUDREX MI BOT - PERPETUAL EDITION v4.3")
         log.info("=" * 60)
         log.info(f"✅ Environment: Railway")
         log.info(f"✅ Port: {PORT}")
@@ -1025,6 +1066,7 @@ def main():
         log.info(f"✅ Volume Fix: Candle-to-candle comparison")
         log.info(f"✅ Timeouts: {TELEGRAM_CONNECT_TIMEOUT}s")
         log.info(f"✅ Retry Logic: 3 attempts with 5s delay")
+        log.info(f"✅ Event Loop: Non-blocking (executor-based)")
         log.info(f"✅ Starting polling mode...")
         log.info("=" * 60)
         
@@ -1045,20 +1087,22 @@ def main():
         if application:
             log.info("🧹 Cleaning up resources...")
 
+# Only run main and print diagnostics when executed directly
 if __name__ == "__main__":
-    log.info("🚀 Starting Mudrex MI Bot - Perpetual Edition v4.2...")
+    log.info("🚀 Starting Mudrex MI Bot - Perpetual Edition v4.3...")
+    log.info("=" * 70)
+    log.info("✅ PRODUCTION-READY v4.3 - ALL CRITICAL FIXES APPLIED!")
+    log.info("=" * 70)
+    log.info("🔧 FIXES APPLIED:")
+    log.info("   • Run blocking HTTP calls in executor (non-blocking event loop)")
+    log.info("   • Safe float parsing with error handling")
+    log.info("   • Remove Markdown parse_mode to avoid parse errors")
+    log.info("   • Move prints inside main guard")
+    log.info("   • Fix volume change threshold logic (>1000 not >100)")
+    log.info("   • Add safe_float helper throughout")
+    log.info("   • Validate empty symbol input")
+    log.info("   • Improve error handling in all functions")
+    log.info("   • Guard array indexing with length checks")
+    log.info("   • Fix application.shutdown() for PTB v20")
+    log.info("=" * 70)
     main()
-
-print("=" * 70)
-print("✅ OPTIMIZED BOT CODE v4.2 - FINAL FORMAT!")
-print("=" * 70)
-print("📦 Mudrex MI Bot - Perpetual Edition v4.2")
-print("=" * 70)
-print("🔥 KEY CHANGES IN v4.2:")
-print("   ✅ Hyperlinked entire header line")
-print("   ✅ Removed 🔥 PERP badge line")
-print("   ✅ Reordered Stats: Last Price → Day High → Day Low → 24h Change → Volume Change")
-print("   ✅ Maintained all v4.1 optimizations (simplified OI, perpetual priority)")
-print("=" * 70)
-print("🚀 READY FOR RAILWAY DEPLOYMENT!")
-print("=" * 70)
