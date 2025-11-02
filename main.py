@@ -1,7 +1,10 @@
 # ============================================================================
-# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.5 (PRODUCTION-READY)
+# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.6 (PRODUCTION-READY)
 # ============================================================================
-# FIXES APPLIED IN v4.5:
+# FIXES APPLIED IN v4.6:
+# - OI now uses CoinGlass API as primary source (accurate aggregated data)
+# - Exchange OI only used as fallback if CoinGlass unavailable
+# FIXES FROM v4.5:
 # CRITICAL FIXES:
 # - Fixed ADX calculation (now properly smoothed, not just DX)
 # - Fixed volume signal duplicate logic with granular levels
@@ -960,29 +963,38 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     funding_line = ""
     liq_line = ""
     
-    # PRIORITY 1: Use exchange-provided data for perpetual contracts
-    exchange_oi = None
+    # PRIORITY: Use CoinGlass for accurate aggregated OI data
+    coinglass_data = fetch_coinglass_data(resolved)
     exchange_funding = None
     
+    # Get funding rate from exchange
     if exchange == "Bybit Perpetual":
-        exchange_oi = safe_float(t.get("openInterest", 0))
         exchange_funding = safe_float(t.get("fundingRate", 0))
     elif exchange == "Binance Perpetual":
-        # Fetch OI and FR separately for Binance
-        oi_value = fetch_binance_perp_open_interest(resolved)
-        if oi_value:
-            exchange_oi = oi_value
         exchange_funding = fetch_binance_perp_funding_rate(resolved)
     
-    # Open Interest - Use exchange data, don't guess
-    if exchange_oi and exchange_oi > 0:
-        oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)}\n"
-    else:
-        # Don't provide misleading estimates
-        if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
-            oi_line = "• Open Interest: Data unavailable\n"
+    # Open Interest - Use CoinGlass API for accurate aggregated data
+    if coinglass_data.get("open_interest") is not None:
+        oi_value = safe_float(coinglass_data["open_interest"])
+        if oi_value > 0:
+            oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
         else:
-            oi_line = ""  # Don't show OI for spot markets
+            oi_line = "• Open Interest: Data unavailable\n"
+    else:
+        # Fallback: Try exchange-specific OI if CoinGlass unavailable
+        exchange_oi = None
+        if exchange == "Bybit Perpetual":
+            exchange_oi = safe_float(t.get("openInterest", 0))
+        elif exchange == "Binance Perpetual":
+            exchange_oi = fetch_binance_perp_open_interest(resolved)
+        
+        if exchange_oi and exchange_oi > 0:
+            oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)}\n"
+        else:
+            if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
+                oi_line = "• Open Interest: Data unavailable\n"
+            else:
+                oi_line = ""  # Don't show OI for spot markets
     
     # Funding Rate - Use exchange data
     if exchange_funding is not None:
@@ -1178,14 +1190,14 @@ def main():
         application.add_error_handler(on_error)
 
         log.info("=" * 60)
-        log.info("🚂 MUDREX MI BOT - PERPETUAL EDITION v4.5")
+        log.info("🚂 MUDREX MI BOT - PERPETUAL EDITION v4.6")
         log.info("=" * 60)
         log.info(f"✅ Environment: Railway")
         log.info(f"✅ Port: {PORT}")
         log.info(f"✅ Exchange Priority: Bybit Perp → Binance Perp → Spot")
         log.info(f"✅ Data Source: Perpetual Futures (Primary)")
         log.info(f"✅ Enhanced TA: EMA, Optimized MACD, RSI, Volume, ADX (FIXED)")
-        log.info(f"✅ Accurate OI: Exchange API data prioritized")
+        log.info(f"✅ Open Interest: CoinGlass API (Accurate aggregated)")
         log.info(f"✅ Caching: Enabled (70% API reduction)")
         log.info(f"✅ Rate Limiting: 10 requests/min per user")
         log.info(f"✅ Output Format: Hyperlinked header, 📁📊 emojis")
@@ -1212,10 +1224,12 @@ def main():
             log.info("🧹 Cleaning up resources...")
 
 if __name__ == "__main__":
-    log.info("🚀 Starting Mudrex MI Bot - Perpetual Edition v4.5...")
+    log.info("🚀 Starting Mudrex MI Bot - Perpetual Edition v4.6...")
     log.info("=" * 70)
-    log.info("✅ PRODUCTION-READY v4.5 - ALL CRITICAL & HIGH PRIORITY FIXES!")
+    log.info("✅ PRODUCTION-READY v4.6 - COINGLASS OI + ALL FIXES!")
     log.info("=" * 70)
+    log.info("🔧 v4.6 UPDATE:")
+    log.info("   • Open Interest: CoinGlass API primary (accurate!)")
     log.info("🔧 CRITICAL FIXES:")
     log.info("   • Fixed ADX calculation (proper smoothing)")
     log.info("   • Fixed volume signal (5 granular levels)")
@@ -1223,7 +1237,6 @@ if __name__ == "__main__":
     log.info("🔧 HIGH PRIORITY FIXES:")
     log.info("   • Implemented exchange info caching (70% faster)")
     log.info("   • Added rate limiting (10 req/min per user)")
-    log.info("   • Improved OI fallback (no misleading data)")
     log.info("   • Exponential backoff for HTTP retries")
     log.info("=" * 70)
     main()
