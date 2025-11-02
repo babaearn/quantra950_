@@ -1,19 +1,19 @@
 # ============================================================================
-# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.6 (PRODUCTION-READY)
+# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.7 (PRODUCTION-READY)
 # ============================================================================
-# FIXES APPLIED IN v4.6:
-# - OI now uses CoinGlass API as primary source (accurate aggregated data)
-# - Exchange OI only used as fallback if CoinGlass unavailable
-# FIXES FROM v4.5:
-# CRITICAL FIXES:
-# - Fixed ADX calculation (now properly smoothed, not just DX)
-# - Fixed volume signal duplicate logic with granular levels
-# - Added Binance Perp funding rate fetch
-# HIGH PRIORITY FIXES:
-# - Implemented exchange info caching (70% API reduction)
-# - Added rate limiting protection (10 req/min per user)
-# - Improved OI fallback logic (no misleading estimates)
-# - Added exponential backoff for HTTP retries
+# NEW IN v4.7:
+# - Integrated Mudrex API for complete data coverage
+# - Mudrex Market Stats endpoint for OI + Funding Rate (single call!)
+# - Mudrex Klines for all coins (even new ones have full data)
+# - Fixed TA fallback warning (only shows when actually needed)
+# - 4-tier data reliability: Mudrex → CoinGlass → Manual → Single Exchange
+# FIXES FROM v4.6:
+# - OI USD conversion (now shows billions, not thousands)
+# - Fixed ADX calculation (proper smoothing)
+# - Fixed volume signal (5 granular levels)
+# - Exchange caching (70% API reduction)
+# - Rate limiting (10 req/min per user)
+# - Exponential backoff for HTTP retries
 # ============================================================================
 
 import os
@@ -536,6 +536,40 @@ def fetch_mudrex_klines(symbol: str, interval: str, limit: int = 100) -> Optiona
         
     except Exception as e:
         log.error(f"Error fetching Mudrex klines: {e}")
+        return None
+
+def fetch_mudrex_market_stats(symbol: str) -> Optional[dict]:
+    """Fetch complete market stats from Mudrex - OI, Funding Rate, Volume, etc."""
+    try:
+        log.info(f"Fetching Mudrex market stats for {symbol}")
+        
+        endpoint = "/market/stats"
+        params = {"symbols": symbol}
+        
+        data = _http_get_mudrex(endpoint, params)
+        if not data or "data" not in data:
+            log.warning(f"Mudrex market stats unavailable for {symbol}")
+            return None
+        
+        stats = data["data"].get(symbol, {})
+        if not stats:
+            log.warning(f"No stats data for {symbol}")
+            return None
+        
+        result = {
+            "openInterest": stats.get("openInterest"),
+            "fundingRate": stats.get("fundingRate"),
+            "volume24h": stats.get("volume24h"),
+            "priceChange24h": stats.get("priceChangePercent24h"),
+            "high24h": stats.get("high24h"),
+            "low24h": stats.get("low24h")
+        }
+        
+        log.info(f"✅ Got Mudrex stats for {symbol}: OI=${safe_float(result['openInterest']):,.0f}, FR={safe_float(result['fundingRate'])*100:.4f}%")
+        return result
+        
+    except Exception as e:
+        log.error(f"Error fetching Mudrex market stats: {e}")
         return None
 
 # -----------------------
@@ -1090,6 +1124,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     sentiment = "N/A"
     volume_signal = "N/A"
     volume_desc = ""
+    ta_timeframe_used = interval  # Track which timeframe was actually used
     
     # Try technical analysis with requested timeframe
     if kl and len(kl) >= 50:
@@ -1112,6 +1147,7 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
                 sentiment = ta_details.get("sentiment", "N/A")
                 volume_signal = ta_details.get("volume_signal", "N/A")
                 volume_desc = ta_details.get("volume_desc", "")
+                ta_timeframe_used = "4h"  # Mark that we used 4h fallback
                 log.info(f"Using 4h data for TA (requested {interval} had insufficient data)")
             except Exception as e:
                 log.warning("Enhanced TA fallback failed for %s: %s", resolved, e)
@@ -1123,47 +1159,72 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     funding_line = ""
     liq_line = ""
     
-    # PRIORITY: Use CoinGlass for accurate aggregated OI data
-    coinglass_data = fetch_coinglass_data(resolved)
-    exchange_funding = None
-    
-    # Get funding rate from exchange
-    if exchange == "Bybit Perpetual":
-        exchange_funding = safe_float(t.get("fundingRate", 0))
-    elif exchange == "Binance Perpetual":
-        exchange_funding = fetch_binance_perp_funding_rate(resolved)
-    
-    # Open Interest - Multi-tier approach for accuracy
-    # Get current price first (needed for OI conversion)
+    # Get current price first (needed for OI conversion fallback)
     last_price = safe_float(t.get("lastPrice", 0))
     
-    # 1. Try CoinGlass (aggregated across all exchanges)
-    if coinglass_data.get("open_interest") is not None:
-        oi_value = safe_float(coinglass_data["open_interest"])
+    # PRIORITY 1: Try Mudrex Market Stats (single call for OI + Funding Rate)
+    mudrex_stats = fetch_mudrex_market_stats(resolved)
+    
+    # Open Interest - Multi-tier approach
+    if mudrex_stats and mudrex_stats.get("openInterest"):
+        oi_value = safe_float(mudrex_stats["openInterest"])
         if oi_value > 0:
-            oi_line = f"• Open Interest: {fmt_large_number(oi_value)} (CoinGlass)\n"
-            log.info(f"Using CoinGlass OI: ${oi_value:,.0f}")
+            oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
+            log.info(f"Using Mudrex OI: ${oi_value:,.0f}")
         else:
             oi_line = "• Open Interest: Data unavailable\n"
     else:
-        log.warning("CoinGlass OI unavailable, trying manual aggregation...")
+        # Fallback 1: Try CoinGlass
+        log.warning("Mudrex OI unavailable, trying CoinGlass...")
+        coinglass_data = fetch_coinglass_data(resolved)
         
-        # 2. Try manual aggregation (Binance + Bybit, converted to USD)
-        manual_oi = fetch_aggregated_oi_manual(resolved, last_price)
-        if manual_oi and manual_oi > 0:
-            oi_line = f"• Open Interest: {fmt_large_number(manual_oi)} (Aggregated)\n"
-            log.info(f"Using manual aggregated OI: ${manual_oi:,.0f}")
+        if coinglass_data.get("open_interest") is not None:
+            oi_value = safe_float(coinglass_data["open_interest"])
+            if oi_value > 0:
+                oi_line = f"• Open Interest: {fmt_large_number(oi_value)} (CoinGlass)\n"
+                log.info(f"Using CoinGlass OI: ${oi_value:,.0f}")
+            else:
+                oi_line = "• Open Interest: Data unavailable\n"
         else:
-            # 3. Try single exchange as last resort
-            log.warning("Manual aggregation failed, falling back to single exchange...")
-            exchange_oi = None
-            if exchange == "Bybit Perpetual":
-                bybit_oi_contracts = safe_float(t.get("openInterest", 0))
-                if bybit_oi_contracts > 0 and last_price > 0:
-                    exchange_oi = bybit_oi_contracts * last_price
-            elif exchange == "Binance Perpetual":
-                binance_oi_contracts = fetch_binance_perp_open_interest(resolved)
-                if binance_oi_contracts and binance_oi_contracts > 0 and last_price > 0:
+            # Fallback 2: Manual aggregation (Binance + Bybit)
+            log.warning("CoinGlass OI unavailable, trying manual aggregation...")
+            manual_oi = fetch_aggregated_oi_manual(resolved, last_price)
+            if manual_oi and manual_oi > 0:
+                oi_line = f"• Open Interest: {fmt_large_number(manual_oi)} (Aggregated)\n"
+                log.info(f"Using manual aggregated OI: ${manual_oi:,.0f}")
+            else:
+                # Fallback 3: Single exchange
+                log.warning("Manual aggregation failed, falling back to single exchange...")
+                exchange_oi = None
+                if exchange == "Bybit Perpetual":
+                    bybit_oi_contracts = safe_float(t.get("openInterest", 0))
+                    if bybit_oi_contracts > 0 and last_price > 0:
+                        exchange_oi = bybit_oi_contracts * last_price
+                elif exchange == "Binance Perpetual":
+                    binance_oi_contracts = fetch_binance_perp_open_interest(resolved)
+                    if binance_oi_contracts and binance_oi_contracts > 0 and last_price > 0:
+                        exchange_oi = binance_oi_contracts * last_price
+                
+                if exchange_oi and exchange_oi > 0:
+                    oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)} ({exchange})\n"
+                    log.warning(f"Using single exchange OI: ${exchange_oi:,.0f}")
+                else:
+                    if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
+                        oi_line = "• Open Interest: Data unavailable\n"
+                    else:
+                        oi_line = ""  # Don't show OI for spot markets
+    
+    # Funding Rate - Use Mudrex first, then fallback to exchange
+    if mudrex_stats and mudrex_stats.get("fundingRate") is not None:
+        exchange_funding = safe_float(mudrex_stats["fundingRate"])
+        log.info(f"Using Mudrex Funding Rate: {exchange_funding*100:.4f}%")
+    else:
+        # Fallback to exchange APIs
+        exchange_funding = None
+        if exchange == "Bybit Perpetual":
+            exchange_funding = safe_float(t.get("fundingRate", 0))
+        elif exchange == "Binance Perpetual":
+            exchange_funding = fetch_binance_perp_funding_rate(resolved)
                     exchange_oi = binance_oi_contracts * last_price
             
             if exchange_oi and exchange_oi > 0:
@@ -1212,9 +1273,9 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
     if note:
         header += f"\n{note}"
     
-    # Add note if TA used different timeframe than requested
-    if kl and len(kl) < 50 and ta_details:
-        header += f"\n⚠️ TA based on 4h (insufficient {interval} data)"
+    # Add note only if TA used different timeframe (not if Mudrex gave full data)
+    if ta_timeframe_used != interval and ta_details:
+        header += f"\n⚠️ TA based on {ta_timeframe_used} (insufficient {interval} data)"
 
     return (
         f"{header}\n\n"
