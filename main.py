@@ -1,19 +1,19 @@
 # ============================================================================
-# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.7 (PRODUCTION-READY)
+# 🚀 OPTIMIZED QE CELL - PERPETUAL FUTURES PRIORITY v4.8 (PRODUCTION-READY)
 # ============================================================================
-# NEW IN v4.7:
+# NEW IN v4.8:
+# - Removed ADX indicator (simplified to 4 core indicators)
+# - Redistributed scoring: 25 points each (RSI, MACD, EMA, Volume)
+# - Enhanced volume signal weighting for better accuracy
+# - Cleaner, faster technical analysis
+# FROM v4.7:
 # - Integrated Mudrex API for complete data coverage
 # - Mudrex Market Stats endpoint for OI + Funding Rate (single call!)
 # - Mudrex Klines for all coins (even new ones have full data)
 # - Fixed TA fallback warning (only shows when actually needed)
 # - 4-tier data reliability: Mudrex → CoinGlass → Manual → Single Exchange
-# FIXES FROM v4.6:
-# - OI USD conversion (now shows billions, not thousands)
-# - Fixed ADX calculation (proper smoothing)
-# - Fixed volume signal (5 granular levels)
-# - Exchange caching (70% API reduction)
-# - Rate limiting (10 req/min per user)
-# - Exponential backoff for HTTP retries
+# - Clean OI display (no source labels)
+# - New format: Market Bias with timeframe
 # ============================================================================
 
 import os
@@ -901,149 +901,80 @@ class EnhancedTechnicalAnalysis:
         
         return signal, description
 
-    def calculate_adx(self, period: int = 14) -> Tuple[float, str]:
-        """ADX for trend strength confirmation - FIXED TO CALCULATE PROPER ADX"""
-        if len(self.closes) < period * 2:
-            return 0.0, "Insufficient data"
-        
-        high_diff = np.diff(self.highs)
-        low_diff = -np.diff(self.lows)
-        
-        plus_dm = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
-        minus_dm = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
-        
-        # Calculate True Range
-        tr = np.maximum(
-            self.highs[1:] - self.lows[1:],
-            np.maximum(
-                np.abs(self.highs[1:] - self.closes[:-1]),
-                np.abs(self.lows[1:] - self.closes[:-1])
-            )
-        )
-        
-        # Calculate smoothed ATR
-        atr = np.zeros(len(tr))
-        atr[period-1] = np.mean(tr[:period])
-        for i in range(period, len(tr)):
-            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-        
-        # Calculate +DI and -DI arrays
-        plus_di = np.zeros(len(plus_dm))
-        minus_di = np.zeros(len(minus_dm))
-        
-        for i in range(period-1, len(plus_dm)):
-            if atr[i] > 0:
-                plus_di[i] = 100 * np.mean(plus_dm[i-period+1:i+1]) / atr[i]
-                minus_di[i] = 100 * np.mean(minus_dm[i-period+1:i+1]) / atr[i]
-        
-        # Calculate DX array
-        dx = np.zeros(len(plus_di))
-        for i in range(period-1, len(dx)):
-            if (plus_di[i] + minus_di[i]) > 0:
-                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i])
-        
-        # ADX is the smoothed average of DX (this is the key fix)
-        adx_values = np.zeros(len(dx))
-        if len(dx) >= period * 2:
-            adx_values[period*2-2] = np.mean(dx[period-1:period*2-1])
-            
-            for i in range(period*2-1, len(dx)):
-                adx_values[i] = (adx_values[i-1] * (period - 1) + dx[i]) / period
-            
-            adx_value = adx_values[-1] if adx_values[-1] > 0 else 0
-        else:
-            # Fallback for shorter data
-            adx_value = np.mean(dx[-period:]) if len(dx) >= period else 0
-        
-        if adx_value > 25:
-            strength = "Strong Trend"
-        elif adx_value > 20:
-            strength = "Moderate Trend"
-        else:
-            strength = "Weak/No Trend"
-        
-        return round(adx_value, 2), strength
-
     def calculate_enhanced_rating(self) -> Tuple[str, int, Dict[str, Any]]:
-        """Enhanced rating system with percentage score"""
+        """Enhanced rating system with percentage score - 4 indicators"""
         score = 0
         max_score = 100
         details = {}
         
-        # 1. Enhanced RSI (20 points)
+        # 1. Enhanced RSI (25 points)
         rsi, rsi_slope = self.calculate_rsi_enhanced()
         details["rsi"] = rsi
         details["rsi_slope"] = rsi_slope
         
         if 40 <= rsi <= 60:
-            score += 20
+            score += 25
         elif 30 <= rsi < 40 and rsi_slope == "Rising":
-            score += 18
+            score += 23
         elif 60 < rsi <= 70 and rsi_slope == "Falling":
-            score += 15
+            score += 20
         elif rsi < 30:
-            score += 12
+            score += 15
         elif rsi > 70:
-            score += 10
+            score += 12
         else:
-            score += 16
+            score += 20
         
-        # 2. Optimized MACD (20 points)
+        # 2. Optimized MACD (25 points)
         macd_val, signal_val, hist, macd_trend, macd_strength = self.calculate_macd_optimized()
         details["macd"] = {"value": macd_val, "signal": signal_val, "trend": macd_trend, "strength": macd_strength}
         
         if macd_trend == "Bullish" and macd_strength == "Strong":
-            score += 20
+            score += 25
         elif macd_trend == "Bullish" and macd_strength == "Weak":
-            score += 15
+            score += 20
         elif macd_trend == "Bearish" and macd_strength == "Strong":
-            score += 8
+            score += 10
         elif macd_trend == "Bearish" and macd_strength == "Weak":
-            score += 12
+            score += 15
         else:
-            score += 14
+            score += 18
         
-        # 3. EMA Trend (20 points)
+        # 3. EMA Trend (25 points)
         ema_trend, ema_distance = self.calculate_ema_trend()
         details["ema_trend"] = ema_trend
         details["ema_distance"] = ema_distance
         
         if "Strong Uptrend" in ema_trend:
-            score += 20
+            score += 25
         elif "Uptrend" in ema_trend:
-            score += 16
+            score += 20
         elif "Strong Downtrend" in ema_trend:
-            score += 8
+            score += 10
         elif "Downtrend" in ema_trend:
-            score += 12
+            score += 15
         else:
-            score += 14
+            score += 18
         
-        # 4. Volume Signal (20 points)
+        # 4. Volume Signal (25 points)
         volume_signal, volume_desc = self.calculate_volume_signal()
         details["volume_signal"] = volume_signal
         details["volume_desc"] = volume_desc
         
-        if "Bullish" in volume_signal and "🟢" in volume_signal:
-            score += 20
+        if "Very Strong Bullish" in volume_signal:
+            score += 25
+        elif "Strong Bullish" in volume_signal:
+            score += 22
         elif "Bullish" in volume_signal:
-            score += 16
-        elif "Bearish" in volume_signal:
-            score += 8
-        else:
-            score += 14
-        
-        # 5. ADX Trend Strength (20 points)
-        adx_value, adx_strength = self.calculate_adx()
-        details["adx"] = adx_value
-        details["adx_strength"] = adx_strength
-        
-        if "Strong Trend" in adx_strength:
             score += 20
-        elif "Moderate Trend" in adx_strength:
-            score += 15
-        else:
+        elif "Very Strong Bearish" in volume_signal:
+            score += 5
+        elif "Strong Bearish" in volume_signal:
+            score += 8
+        elif "Bearish" in volume_signal:
             score += 10
+        else:
+            score += 15  # Weak/Very Weak
         
         # Determine rating with CORRECTED EMOJIS
         if score >= 85:
@@ -1269,14 +1200,14 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
 
     return (
         f"{header}\n\n"
-        f"📁 Signals\n"
+        f"🔹 Market Bias - {interval.upper()}\n"
         f"• Market Sentiment: {sentiment}\n"
         f"• Technical Rating: {rating}\n"
         f"• Volume Signal: {volume_signal} ({volume_desc})\n"
         f"{oi_line}"
         f"{funding_line}"
         f"{liq_line}\n"
-        f"📊 Stats\n"
+        f"🔹 Stats\n"
         f"• Last Price: {fmt_price(last_price)}\n"
         f"• Day High: {fmt_price(high)}\n"
         f"• Day Low: {fmt_price(low)}\n"
