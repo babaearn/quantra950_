@@ -1,3 +1,19 @@
+# ============================================================================
+# 🚀 MUDREX MI BOT v5.5 - ULTIMATE PERPETUAL FUTURES EDITION
+# ============================================================================
+# NEW IN v5.5:
+# - Added Bollinger Bands indicator (volatility & overbought/oversold detection)
+# - 5 comprehensive indicators (20 points each = 100 total)
+# - Enhanced signal accuracy with volatility awareness
+# FROM v4.8:
+# - Mudrex API for complete data coverage
+# - Mudrex Market Stats endpoint for OI + Funding Rate
+# - Enhanced TA: RSI (Wilder's), MACD (8/21/5), EMA (9/21), Volume (7 levels)
+# - 4-tier data reliability: Mudrex → CoinGlass → Manual → Single Exchange
+# - Exchange Priority: Bybit Perp → Binance Perp → Binance Spot
+# - Rate limiting, caching, exponential backoff
+# ============================================================================
+
 import os
 import time
 import logging
@@ -5,6 +21,8 @@ import signal
 import sys
 from typing import List, Optional, Dict, Any, Tuple
 from functools import wraps
+from datetime import datetime, timedelta
+from collections import defaultdict
 import asyncio
 
 import requests
@@ -32,6 +50,7 @@ log = logging.getLogger("mudrex_mi_bot")
 # Environment Variables (Railway)
 # -----------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 
 # -----------------------
@@ -43,46 +62,74 @@ TELEGRAM_WRITE_TIMEOUT = 30
 TELEGRAM_POOL_TIMEOUT = 30
 
 # -----------------------
+# Rate Limiting Configuration
+# -----------------------
+MAX_REQUESTS_PER_USER = 10
+_rate_limiter = defaultdict(list)
+
+# -----------------------
 # Exchange Configuration
 # -----------------------
-BINANCE_HOSTS = [
-    "https://api.binance.com",
-    "https://api-gcp.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
+BYBIT_HOSTS = [
+    "https://api.bybit.com",
+    "https://api.bytick.com"
 ]
 
-KUCOIN_HOSTS = [
-    "https://api.kucoin.com"
+BINANCE_HOSTS = [
+    "https://fapi.binance.com",
+    "https://api.binance.com",
 ]
+
+COINGLASS_API_BASE = "https://open-api.coinglass.com/public/v2"
+COINGLASS_TIMEOUT = 5
+
+MUDREX_API_BASE = "https://price.mudrex.com/api/v1"
+MUDREX_TIMEOUT = 10
 
 HTTP_TIMEOUT = 5
 EXCHANGEINFO_TTL = 30 * 60
 
-_exchangeinfo_cache: Dict[str, Any] = {"binance": {"expires": 0, "data": None}, "kucoin": {"expires": 0, "data": None}}
-PREFERRED_QUOTES = ["USDT", "FDUSD", "USDC"]
+_exchangeinfo_cache: Dict[str, Any] = {
+    "bybit_perp": {"expires": 0, "data": None, "symbols": set()},
+    "binance_perp": {"expires": 0, "data": None, "symbols": set()},
+    "binance_spot": {"expires": 0, "data": None, "symbols": set()},
+}
 
-# Interval mappings
 VALID_INTERVALS = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"
 }
 
-INTERVAL_TO_KUCOIN = {
-    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1hour", "2h": "2hour", "4h": "4hour", "6h": "6hour", "8h": "6hour", "12h": "12hour",
-    "1d": "1day", "3d": "1day", "1w": "1week"
+INTERVAL_TO_BYBIT = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "8h": "480", "12h": "720",
+    "1d": "D", "3d": "D", "1w": "W"
 }
 
 DEFAULT_INTERVAL = "1h"
-
-# Global application instance
 application = None
 
 # -----------------------
-# Retry Decorator
+# Helper Functions
 # -----------------------
+def safe_float(x, default=0.0) -> float:
+    """Safely convert value to float with fallback"""
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except (ValueError, TypeError):
+        return default
+
+def check_rate_limit(user_id: int) -> bool:
+    """Check if user exceeded rate limit"""
+    now = datetime.now()
+    one_minute_ago = now - timedelta(minutes=1)
+    _rate_limiter[user_id] = [ts for ts in _rate_limiter[user_id] if ts > one_minute_ago]
+    if len(_rate_limiter[user_id]) >= MAX_REQUESTS_PER_USER:
+        return False
+    _rate_limiter[user_id].append(now)
+    return True
+
 def retry_on_telegram_error(max_retries: int = 3, delay: int = 5):
     """Decorator to retry Telegram operations on network errors"""
     def decorator(func):
@@ -113,10 +160,10 @@ def retry_on_telegram_error(max_retries: int = 3, delay: int = 5):
 # -----------------------
 # HTTP Helpers
 # -----------------------
-def _http_get_binance(path: str, params: dict) -> Optional[requests.Response]:
-    """HTTP GET for Binance with multi-host failover"""
+def _http_get_bybit(path: str, params: dict) -> Optional[requests.Response]:
+    """HTTP GET for Bybit with retry logic"""
     last_exc = None
-    for host in BINANCE_HOSTS:
+    for host in BYBIT_HOSTS:
         url = f"{host}{path}"
         for attempt in range(2):
             try:
@@ -124,227 +171,493 @@ def _http_get_binance(path: str, params: dict) -> Optional[requests.Response]:
                 if 400 <= r.status_code < 500 and r.status_code != 429:
                     return r
                 if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(0.5 * (attempt + 1))
+                    time.sleep(min(2 ** attempt * 0.5, 5))
                     continue
                 if r.status_code == 200:
                     return r
             except requests.RequestException as e:
                 last_exc = e
-                time.sleep(0.3)
+                time.sleep(min(2 ** attempt * 0.3, 3))
+    log.error(f"Bybit HTTP GET FAILED: {path} | Last error: {last_exc}")
+    return None
+
+def _http_get_binance(path: str, params: dict, use_futures: bool = True) -> Optional[requests.Response]:
+    """HTTP GET for Binance with futures/spot selection"""
+    last_exc = None
+    hosts = [BINANCE_HOSTS[0]] if use_futures else [BINANCE_HOSTS[1]]
+    for host in hosts:
+        url = f"{host}{path}"
+        for attempt in range(2):
+            try:
+                r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    return r
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(min(2 ** attempt * 0.5, 5))
+                    continue
+                if r.status_code == 200:
+                    return r
+            except requests.RequestException as e:
+                last_exc = e
+                time.sleep(min(2 ** attempt * 0.3, 3))
     log.error(f"Binance HTTP GET FAILED: {path} | Last error: {last_exc}")
     return None
 
-def _http_get_kucoin(path: str, params: dict) -> Optional[requests.Response]:
-    """HTTP GET for KuCoin with retry logic"""
-    last_exc = None
-    for host in KUCOIN_HOSTS:
-        url = f"{host}{path}"
-        for attempt in range(2):
-            try:
-                r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-                if 400 <= r.status_code < 500 and r.status_code != 429:
-                    return r
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                if r.status_code == 200:
-                    return r
-            except requests.RequestException as e:
-                last_exc = e
-                time.sleep(0.3)
-    log.error(f"KuCoin HTTP GET FAILED: {path} | Last error: {last_exc}")
-    return None
-
-# -----------------------
-# Binance Functions
-# -----------------------
-def _get_binance_exchangeinfo() -> Optional[dict]:
-    """Get Binance exchange info with caching"""
-    now = time.time()
-    if _exchangeinfo_cache["binance"]["data"] and now < _exchangeinfo_cache["binance"]["expires"]:
-        return _exchangeinfo_cache["binance"]["data"]
-    r = _http_get_binance("/api/v3/exchangeInfo", params={})
-    if not r or r.status_code != 200:
-        return None
-    data = r.json()
-    _exchangeinfo_cache["binance"]["data"] = data
-    _exchangeinfo_cache["binance"]["expires"] = now + EXCHANGEINFO_TTL
-    return data
-
-def _binance_symbol_exists(symbol: str) -> bool:
-    """Check if a trading symbol exists on Binance"""
-    info = _get_binance_exchangeinfo()
-    if info and "symbols" in info:
-        symbols = {s["symbol"] for s in info["symbols"]}
-        if symbol in symbols:
-            return True
-    r = _http_get_binance("/api/v3/exchangeInfo", params={"symbol": symbol})
-    return bool(r and r.status_code == 200)
-
-def fetch_binance_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker statistics from Binance"""
-    r = _http_get_binance("/api/v3/ticker/24hr", params={"symbol": symbol})
-    if not r or r.status_code != 200:
-        return None
-    return r.json()
-
-def fetch_binance_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch candlestick/kline data from Binance"""
-    r = _http_get_binance("/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-    if not r or r.status_code != 200:
-        return None
-    return r.json()
-
-# -----------------------
-# KuCoin Functions
-# -----------------------
-def _kucoin_symbol_exists(symbol: str) -> bool:
-    """Check if a trading symbol exists on KuCoin"""
+def _http_get_coinglass(endpoint: str, params: dict = None) -> Optional[dict]:
+    """HTTP GET for CoinGlass API"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        r = _http_get_kucoin("/api/v1/market/orderbook/level1", params={"symbol": kucoin_symbol})
+        url = f"{COINGLASS_API_BASE}{endpoint}"
+        headers = {}
+        if COINGLASS_API_KEY:
+            headers["CG-API-KEY"] = COINGLASS_API_KEY
+        r = requests.get(url, params=params or {}, headers=headers, timeout=COINGLASS_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            log.warning(f"CoinGlass API returned status {r.status_code}")
+            return None
+    except Exception as e:
+        log.warning(f"CoinGlass API error: {e}")
+        return None
+
+def _http_get_mudrex(endpoint: str, params: dict = None) -> Optional[dict]:
+    """HTTP GET for Mudrex API"""
+    try:
+        url = f"{MUDREX_API_BASE}{endpoint}"
+        r = requests.get(url, params=params or {}, timeout=MUDREX_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success"):
+                return data
+            else:
+                log.warning(f"Mudrex API returned success=false")
+                return None
+        else:
+            log.warning(f"Mudrex API returned status {r.status_code}")
+            return None
+    except Exception as e:
+        log.warning(f"Mudrex API error: {e}")
+        return None
+
+# -----------------------
+# Exchange Info Caching
+# -----------------------
+def _fetch_and_cache_bybit_symbols() -> set:
+    """Fetch and cache Bybit perpetual symbols"""
+    try:
+        r = _http_get_bybit("/v5/market/instruments-info", params={"category": "linear"})
         if r and r.status_code == 200:
             data = r.json()
-            return data.get("code") == "200000" and data.get("data") is not None
-        return False
+            if data.get("retCode") == 0:
+                symbols = {item["symbol"] for item in data.get("result", {}).get("list", [])}
+                _exchangeinfo_cache["bybit_perp"]["symbols"] = symbols
+                _exchangeinfo_cache["bybit_perp"]["expires"] = time.time() + EXCHANGEINFO_TTL
+                log.info(f"Cached {len(symbols)} Bybit perpetual symbols")
+                return symbols
     except Exception as e:
-        log.error(f"Error checking KuCoin symbol: {e}")
-        return False
+        log.error(f"Error fetching Bybit symbols: {e}")
+    return set()
 
-def fetch_kucoin_ticker(symbol: str) -> Optional[dict]:
-    """Fetch 24-hour ticker statistics from KuCoin"""
+def _fetch_and_cache_binance_perp_symbols() -> set:
+    """Fetch and cache Binance perpetual symbols"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        r = _http_get_kucoin("/api/v1/market/stats", params={"symbol": kucoin_symbol})
+        r = _http_get_binance("/fapi/v1/exchangeInfo", params={}, use_futures=True)
+        if r and r.status_code == 200:
+            data = r.json()
+            symbols = {s["symbol"] for s in data.get("symbols", [])}
+            _exchangeinfo_cache["binance_perp"]["symbols"] = symbols
+            _exchangeinfo_cache["binance_perp"]["expires"] = time.time() + EXCHANGEINFO_TTL
+            log.info(f"Cached {len(symbols)} Binance perpetual symbols")
+            return symbols
+    except Exception as e:
+        log.error(f"Error fetching Binance perp symbols: {e}")
+    return set()
+
+def _fetch_and_cache_binance_spot_symbols() -> set:
+    """Fetch and cache Binance spot symbols"""
+    try:
+        r = _http_get_binance("/api/v3/exchangeInfo", params={}, use_futures=False)
+        if r and r.status_code == 200:
+            data = r.json()
+            symbols = {s["symbol"] for s in data.get("symbols", [])}
+            _exchangeinfo_cache["binance_spot"]["symbols"] = symbols
+            _exchangeinfo_cache["binance_spot"]["expires"] = time.time() + EXCHANGEINFO_TTL
+            log.info(f"Cached {len(symbols)} Binance spot symbols")
+            return symbols
+    except Exception as e:
+        log.error(f"Error fetching Binance spot symbols: {e}")
+    return set()
+
+# -----------------------
+# Bybit Functions
+# -----------------------
+def _bybit_perp_symbol_exists(symbol: str) -> bool:
+    """Check if symbol exists on Bybit"""
+    now = time.time()
+    if _exchangeinfo_cache["bybit_perp"]["expires"] > now:
+        return symbol in _exchangeinfo_cache["bybit_perp"]["symbols"]
+    symbols = _fetch_and_cache_bybit_symbols()
+    return symbol in symbols
+
+def fetch_bybit_perp_ticker(symbol: str) -> Optional[dict]:
+    """Fetch ticker from Bybit Perpetual"""
+    try:
+        r = _http_get_bybit("/v5/market/tickers", params={"category": "linear", "symbol": symbol})
         if not r or r.status_code != 200:
             return None
         data = r.json()
-        if data.get("code") != "200000" or not data.get("data"):
+        if data.get("retCode") != 0 or not data.get("result", {}).get("list"):
             return None
-        ticker = data["data"]
+        ticker = data["result"]["list"][0]
         return {
             "symbol": symbol,
-            "lastPrice": ticker.get("last"),
-            "priceChangePercent": float(ticker.get("changeRate", 0)) * 100,
-            "highPrice": ticker.get("high"),
-            "lowPrice": ticker.get("low"),
-            "volume": ticker.get("vol")
+            "lastPrice": ticker.get("lastPrice"),
+            "priceChangePercent": safe_float(ticker.get("price24hPcnt", 0)) * 100,
+            "highPrice": ticker.get("highPrice24h"),
+            "lowPrice": ticker.get("lowPrice24h"),
+            "volume": ticker.get("volume24h"),
+            "openInterest": ticker.get("openInterest"),
+            "fundingRate": ticker.get("fundingRate")
         }
     except Exception as e:
-        log.error(f"Error fetching KuCoin ticker: {e}")
+        log.error(f"Error fetching Bybit ticker: {e}")
         return None
 
-def fetch_kucoin_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch candlestick/kline data from KuCoin"""
+def fetch_bybit_perp_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch klines from Bybit Perpetual"""
     try:
-        kucoin_symbol = f"{symbol[:-4]}-{symbol[-4:]}" if len(symbol) > 4 else symbol
-        kucoin_interval = INTERVAL_TO_KUCOIN.get(interval, "1hour")
-        end_time = int(time.time())
-        start_time = end_time - (limit * 3600)
-        r = _http_get_kucoin("/api/v1/market/candles", params={
-            "symbol": kucoin_symbol,
-            "type": kucoin_interval,
-            "startAt": start_time,
-            "endAt": end_time
+        bybit_interval = INTERVAL_TO_BYBIT.get(interval, "60")
+        r = _http_get_bybit("/v5/market/kline", params={
+            "category": "linear",
+            "symbol": symbol,
+            "interval": bybit_interval,
+            "limit": limit
         })
         if not r or r.status_code != 200:
             return None
         data = r.json()
-        if data.get("code") != "200000" or not data.get("data"):
+        if data.get("retCode") != 0 or not data.get("result", {}).get("list"):
             return None
         klines = []
-        for k in data["data"]:
-            klines.append([k[0], k[1], k[3], k[4], k[2], k[5], k[0]])
+        for k in data["result"]["list"]:
+            if len(k) >= 6:
+                klines.append([k[0], k[1], k[2], k[3], k[4], k[5], k[0]])
         return list(reversed(klines))
     except Exception as e:
-        log.error(f"Error fetching KuCoin klines: {e}")
+        log.error(f"Error fetching Bybit klines: {e}")
         return None
+
+# -----------------------
+# Binance Perpetual Functions
+# -----------------------
+def _binance_perp_symbol_exists(symbol: str) -> bool:
+    """Check if symbol exists on Binance Futures"""
+    now = time.time()
+    if _exchangeinfo_cache["binance_perp"]["expires"] > now:
+        return symbol in _exchangeinfo_cache["binance_perp"]["symbols"]
+    symbols = _fetch_and_cache_binance_perp_symbols()
+    return symbol in symbols
+
+def fetch_binance_perp_ticker(symbol: str) -> Optional[dict]:
+    """Fetch ticker from Binance Perpetual"""
+    try:
+        r = _http_get_binance("/fapi/v1/ticker/24hr", params={"symbol": symbol}, use_futures=True)
+        if not r or r.status_code != 200:
+            return None
+        data = r.json()
+        return {
+            "symbol": symbol,
+            "lastPrice": data.get("lastPrice"),
+            "priceChangePercent": safe_float(data.get("priceChangePercent", 0)),
+            "highPrice": data.get("highPrice"),
+            "lowPrice": data.get("lowPrice"),
+            "volume": data.get("volume")
+        }
+    except Exception as e:
+        log.error(f"Error fetching Binance perp ticker: {e}")
+        return None
+
+def fetch_binance_perp_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch klines from Binance Perpetual"""
+    try:
+        r = _http_get_binance("/fapi/v1/klines", params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }, use_futures=True)
+        if not r or r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"Error fetching Binance perp klines: {e}")
+        return None
+
+def fetch_binance_perp_open_interest(symbol: str) -> Optional[float]:
+    """Fetch OI from Binance Perpetual"""
+    try:
+        r = _http_get_binance("/fapi/v1/openInterest", params={"symbol": symbol}, use_futures=True)
+        if not r or r.status_code != 200:
+            return None
+        data = r.json()
+        return safe_float(data.get("openInterest", 0))
+    except Exception as e:
+        log.error(f"Error fetching Binance OI: {e}")
+        return None
+
+def fetch_binance_perp_funding_rate(symbol: str) -> Optional[float]:
+    """Fetch funding rate from Binance Perpetual"""
+    try:
+        r = _http_get_binance("/fapi/v1/premiumIndex", params={"symbol": symbol}, use_futures=True)
+        if not r or r.status_code != 200:
+            return None
+        data = r.json()
+        return safe_float(data.get("lastFundingRate", 0))
+    except Exception as e:
+        log.error(f"Error fetching Binance funding rate: {e}")
+        return None
+
+def fetch_aggregated_oi_manual(symbol: str, current_price: float) -> Optional[float]:
+    """Manually aggregate OI from multiple exchanges"""
+    try:
+        total_oi_usd = 0.0
+        binance_oi = fetch_binance_perp_open_interest(symbol)
+        if binance_oi and binance_oi > 0 and current_price > 0:
+            binance_oi_usd = binance_oi * current_price
+            total_oi_usd += binance_oi_usd
+            log.info(f"Binance Perp OI: {binance_oi:.2f} = ${binance_oi_usd:,.0f}")
+        bybit_ticker = fetch_bybit_perp_ticker(symbol)
+        if bybit_ticker and bybit_ticker.get("openInterest"):
+            bybit_oi = safe_float(bybit_ticker["openInterest"])
+            if bybit_oi > 0 and current_price > 0:
+                bybit_oi_usd = bybit_oi * current_price
+                total_oi_usd += bybit_oi_usd
+                log.info(f"Bybit Perp OI: {bybit_oi:.2f} = ${bybit_oi_usd:,.0f}")
+        if total_oi_usd > 0:
+            log.info(f"✅ Manual aggregated OI for {symbol}: ${total_oi_usd:,.0f}")
+            return total_oi_usd
+        return None
+    except Exception as e:
+        log.error(f"Error in manual OI aggregation: {e}")
+        return None
+
+# -----------------------
+# Mudrex API Functions
+# -----------------------
+def fetch_mudrex_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch klines from Mudrex API"""
+    try:
+        base_currency = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+        quote_currency = "USDT"
+        aggregation_map = {
+            "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "8h": "8h", "12h": "12h",
+            "1d": "1d", "3d": "3d", "1w": "1w"
+        }
+        aggregation = aggregation_map.get(interval, "1h")
+        duration_map = {
+            "1m": "2d", "3m": "1w", "5m": "1w", "15m": "2w", "30m": "1M",
+            "1h": "5d", "2h": "10d", "4h": "20d", "6h": "30d", "8h": "40d", "12h": "60d",
+            "1d": "120d", "3d": "1y", "1w": "3y"
+        }
+        duration = duration_map.get(interval, "5d")
+        log.info(f"Fetching Mudrex klines for {base_currency}/{quote_currency} {interval}")
+        endpoint = f"/asset/{base_currency}/{quote_currency}/klines"
+        params = {"duration": duration, "aggregation": aggregation, "type": "LINEAR"}
+        data = _http_get_mudrex(endpoint, params)
+        if not data or "data" not in data:
+            log.warning(f"Mudrex klines unavailable for {symbol}")
+            return None
+        klines_data = data["data"]
+        if not klines_data or len(klines_data) == 0:
+            log.warning(f"Mudrex returned empty klines for {symbol}")
+            return None
+        klines = []
+        for k in klines_data[-limit:]:
+            klines.append([
+                k.get("timestamp", 0),
+                str(k.get("open", 0)),
+                str(k.get("high", 0)),
+                str(k.get("low", 0)),
+                str(k.get("close", 0)),
+                str(k.get("volume", 0)),
+                k.get("timestamp", 0)
+            ])
+        log.info(f"✅ Got {len(klines)} Mudrex klines for {symbol} at {interval}")
+        return klines
+    except Exception as e:
+        log.error(f"Error fetching Mudrex klines: {e}")
+        return None
+
+def fetch_mudrex_market_stats(symbol: str) -> Optional[dict]:
+    """Fetch market stats from Mudrex"""
+    try:
+        log.info(f"Fetching Mudrex market stats for {symbol}")
+        endpoint = "/market/stats"
+        params = {"symbols": symbol}
+        data = _http_get_mudrex(endpoint, params)
+        if not data or "data" not in data:
+            log.warning(f"Mudrex market stats unavailable for {symbol}")
+            return None
+        stats = data["data"].get(symbol, {})
+        if not stats:
+            log.warning(f"No stats data for {symbol}")
+            return None
+        result = {
+            "openInterest": stats.get("openInterest"),
+            "fundingRate": stats.get("fundingRate"),
+            "volume24h": stats.get("volume24h"),
+            "priceChange24h": stats.get("priceChangePercent24h"),
+            "high24h": stats.get("high24h"),
+            "low24h": stats.get("low24h")
+        }
+        log.info(f"✅ Got Mudrex stats for {symbol}")
+        return result
+    except Exception as e:
+        log.error(f"Error fetching Mudrex market stats: {e}")
+        return None
+
+# -----------------------
+# Binance Spot Functions
+# -----------------------
+def _binance_spot_symbol_exists(symbol: str) -> bool:
+    """Check if symbol exists on Binance Spot"""
+    now = time.time()
+    if _exchangeinfo_cache["binance_spot"]["expires"] > now:
+        return symbol in _exchangeinfo_cache["binance_spot"]["symbols"]
+    symbols = _fetch_and_cache_binance_spot_symbols()
+    return symbol in symbols
+
+def fetch_binance_spot_ticker(symbol: str) -> Optional[dict]:
+    """Fetch ticker from Binance Spot"""
+    try:
+        r = _http_get_binance("/api/v3/ticker/24hr", params={"symbol": symbol}, use_futures=False)
+        if not r or r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"Error fetching Binance spot ticker: {e}")
+        return None
+
+def fetch_binance_spot_klines(symbol: str, interval: str, limit: int = 100) -> Optional[List[List]]:
+    """Fetch klines from Binance Spot"""
+    try:
+        r = _http_get_binance("/api/v3/klines", params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }, use_futures=False)
+        if not r or r.status_code != 200:
+            return None
+        return r.json()
+    except Exception as e:
+        log.error(f"Error fetching Binance spot klines: {e}")
+        return None
+
+# -----------------------
+# CoinGlass Functions
+# -----------------------
+def fetch_coinglass_data(symbol: str) -> Dict[str, Any]:
+    """Fetch OI and funding rate from CoinGlass"""
+    result = {
+        "open_interest": None,
+        "funding_rate": None,
+    }
+    try:
+        base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+        log.info(f"Fetching CoinGlass data for {base_symbol}...")
+        oi_data = _http_get_coinglass("/indicator/open-interest", {"symbol": base_symbol})
+        if oi_data and oi_data.get("success") and oi_data.get("data"):
+            oi_value = oi_data["data"].get("openInterest") or oi_data["data"].get("usdValue")
+            if oi_value:
+                result["open_interest"] = safe_float(oi_value)
+                log.info(f"✅ CoinGlass OI for {base_symbol}: ${result['open_interest']:,.0f}")
+    except Exception as e:
+        log.error(f"Error fetching CoinGlass data: {e}")
+    return result
 
 # -----------------------
 # Symbol Resolution
 # -----------------------
 def _normalize_command(text: str) -> Tuple[str, Optional[str]]:
-    """Parse command text to extract symbol and timeframe"""
+    """Parse command text"""
     s = text.strip()
     if s.startswith("/"):
         s = s[1:]
     s = s.split("@")[0]
     parts = s.split()
+    if not parts or not parts[0]:
+        return "", None
     symbol = parts[0].upper().replace("/", "")
     tf = parts[1].lower() if len(parts) > 1 else None
     return symbol, tf
 
 def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve symbol with smart fallback"""
-    is_xaut = "XAUT" in symbol.upper()
-    
-    if is_xaut:
-        if _kucoin_symbol_exists(symbol):
-            log.info(f"Found {symbol} on KuCoin")
-            return symbol, "KuCoin", None
-    
-    if _binance_symbol_exists(symbol):
-        log.info(f"Found {symbol} on Binance")
-        return symbol, "Binance", None
-
-    for q in sorted(PREFERRED_QUOTES, key=len, reverse=True):
-        if symbol.endswith(q):
-            base = symbol[:-len(q)]
-            if not base:
-                break
-            for alt in PREFERRED_QUOTES:
-                alt_sym = f"{base}{alt}"
-                if is_xaut and _kucoin_symbol_exists(alt_sym):
-                    log.info(f"Resolved {symbol} to {alt_sym} on KuCoin")
-                    return alt_sym, "KuCoin", f"Resolved to {alt_sym}"
-                if _binance_symbol_exists(alt_sym):
-                    log.info(f"Resolved {symbol} to {alt_sym} on Binance")
-                    return alt_sym, "Binance", f"Resolved to {alt_sym}"
-            break
-
-    for q in PREFERRED_QUOTES:
-        candidate = f"{symbol}{q}"
-        if is_xaut and _kucoin_symbol_exists(candidate):
-            log.info(f"Found {candidate} on KuCoin")
-            return candidate, "KuCoin", None
-        if _binance_symbol_exists(candidate):
-            log.info(f"Found {candidate} on Binance")
-            return candidate, "Binance", None
-
+    """Resolve symbol with priority: Bybit Perp → Binance Perp → Binance Spot"""
+    if not symbol:
+        return None, None, None
+    base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+    bybit_perp_symbol = f"{base_symbol}USDT"
+    if _bybit_perp_symbol_exists(bybit_perp_symbol):
+        log.info(f"✅ Found {bybit_perp_symbol} on Bybit Perpetual")
+        return bybit_perp_symbol, "Bybit Perpetual", None
+    binance_perp_symbol = f"{base_symbol}USDT"
+    if _binance_perp_symbol_exists(binance_perp_symbol):
+        log.info(f"✅ Found {binance_perp_symbol} on Binance Perpetual")
+        return binance_perp_symbol, "Binance Perpetual", None
+    binance_spot_symbol = f"{base_symbol}USDT"
+    if _binance_spot_symbol_exists(binance_spot_symbol):
+        log.info(f"✅ Found {binance_spot_symbol} on Binance Spot (Fallback)")
+        return binance_spot_symbol, "Binance Spot", "Using Spot (Perp not available)"
+    for quote in ["USDC", "FDUSD"]:
+        alt_symbol = f"{base_symbol}{quote}"
+        if _bybit_perp_symbol_exists(alt_symbol):
+            return alt_symbol, "Bybit Perpetual", f"Resolved to {alt_symbol}"
+        if _binance_perp_symbol_exists(alt_symbol):
+            return alt_symbol, "Binance Perpetual", f"Resolved to {alt_symbol}"
+        if _binance_spot_symbol_exists(alt_symbol):
+            return alt_symbol, "Binance Spot", f"Resolved to {alt_symbol} (Spot)"
     return None, None, None
 
 # -----------------------
 # Unified Data Fetching
 # -----------------------
 def fetch_ticker(symbol: str, exchange: str) -> Optional[dict]:
-    """Fetch ticker data from specified exchange"""
-    if exchange == "Binance":
-        return fetch_binance_ticker(symbol)
-    elif exchange == "KuCoin":
-        return fetch_kucoin_ticker(symbol)
+    """Fetch ticker data"""
+    if exchange == "Bybit Perpetual":
+        return fetch_bybit_perp_ticker(symbol)
+    elif exchange == "Binance Perpetual":
+        return fetch_binance_perp_ticker(symbol)
+    elif exchange == "Binance Spot":
+        return fetch_binance_spot_ticker(symbol)
     return None
 
 def fetch_klines(symbol: str, exchange: str, interval: str, limit: int = 100) -> Optional[List[List]]:
-    """Fetch klines data from specified exchange"""
-    if exchange == "Binance":
-        return fetch_binance_klines(symbol, interval, limit)
-    elif exchange == "KuCoin":
-        return fetch_kucoin_klines(symbol, interval, limit)
+    """Fetch klines data"""
+    if exchange == "Bybit Perpetual":
+        return fetch_bybit_perp_klines(symbol, interval, limit)
+    elif exchange == "Binance Perpetual":
+        return fetch_binance_perp_klines(symbol, interval, limit)
+    elif exchange == "Binance Spot":
+        return fetch_binance_spot_klines(symbol, interval, limit)
     return None
 
 # -----------------------
-# Enhanced Technical Analysis with Bollinger Bands
+# ENHANCED Technical Analysis with Bollinger Bands (v5.5)
 # -----------------------
-class TechnicalAnalysis:
-    """Technical analysis calculator with Bollinger Bands"""
+class EnhancedTechnicalAnalysis:
+    """Enhanced TA with 5 indicators including Bollinger Bands"""
     
-    def __init__(self, closes: List[float]):
-        if len(closes) < 30:
-            raise ValueError("Need at least 30 closing prices")
-        self.prices = np.array(closes, dtype=float)
+    def __init__(self, klines: List[List]):
+        if len(klines) < 50:
+            raise ValueError("Need at least 50 candles")
+        self.closes = np.array([safe_float(k[4]) for k in klines], dtype=float)
+        self.highs = np.array([safe_float(k[2]) for k in klines], dtype=float)
+        self.lows = np.array([safe_float(k[3]) for k in klines], dtype=float)
+        self.volumes = np.array([safe_float(k[5]) for k in klines], dtype=float)
+        self.opens = np.array([safe_float(k[1]) for k in klines], dtype=float)
 
     def _ema(self, data: np.ndarray, period: int) -> np.ndarray:
-        """Calculate Exponential Moving Average"""
+        """Calculate EMA"""
         alpha = 2 / (period + 1)
         ema = np.zeros_like(data, dtype=float)
         ema[0] = data[0]
@@ -352,191 +665,451 @@ class TechnicalAnalysis:
             ema[i] = alpha * data[i] + (1 - alpha) * ema[i - 1]
         return ema
 
-    def calculate_rsi(self, period: int = 14) -> float:
-        """Calculate Relative Strength Index"""
-        delta = np.diff(self.prices)
+    def calculate_rsi_enhanced(self, period: int = 14) -> Tuple[float, str]:
+        """Enhanced RSI with Wilder's smoothing"""
+        delta = np.diff(self.closes)
         gains = np.where(delta > 0, delta, 0.0)
         losses = np.where(delta < 0, -delta, 0.0)
-        avg_gain = float(np.mean(gains[-period:]))
-        avg_loss = float(np.mean(losses[-period:]))
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
+        avg_gain = np.zeros(len(gains))
+        avg_loss = np.zeros(len(losses))
+        avg_gain[period-1] = np.mean(gains[:period])
+        avg_loss[period-1] = np.mean(losses[:period])
+        for i in range(period, len(gains)):
+            avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i]) / period
+            avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i]) / period
+        rs = avg_gain[-1] / avg_loss[-1] if avg_loss[-1] != 0 else 100
         rsi_value = 100 - (100 / (1 + rs))
-        return round(rsi_value, 2)
+        if len(self.closes) >= period + 5:
+            rsi_prev = 100 - (100 / (1 + (avg_gain[-5] / avg_loss[-5]))) if avg_loss[-5] != 0 else 100
+            rsi_slope = "Rising" if rsi_value > rsi_prev else "Falling"
+        else:
+            rsi_slope = "Neutral"
+        return round(rsi_value, 2), rsi_slope
 
-    def calculate_macd(self, short: int = 12, long: int = 26, signal: int = 9):
-        """Calculate MACD indicator"""
-        macd = self._ema(self.prices, short) - self._ema(self.prices, long)
-        signal_line = self._ema(macd, signal)
-        macd_val = round(macd[-1], 4)
-        signal_val = round(signal_line[-1], 4)
-        trend = "Bullish" if macd_val > signal_val else "Bearish"
-        return macd_val, trend
+    def calculate_macd_optimized(self, fast: int = 8, slow: int = 21, signal: int = 5):
+        """Optimized MACD for crypto"""
+        macd_line = self._ema(self.closes, fast) - self._ema(self.closes, slow)
+        signal_line = self._ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        macd_val = round(macd_line[-1], 6)
+        signal_val = round(signal_line[-1], 6)
+        hist_val = round(histogram[-1], 6)
+        if len(histogram) >= 2:
+            if macd_val > signal_val:
+                trend = "Bullish"
+                strength = "Strong" if hist_val > histogram[-2] else "Weak"
+            else:
+                trend = "Bearish"
+                strength = "Strong" if hist_val < histogram[-2] else "Weak"
+        else:
+            trend = "Neutral"
+            strength = "Weak"
+        return macd_val, signal_val, hist_val, trend, strength
 
-    def calculate_sma(self, period: int) -> float:
-        """Calculate Simple Moving Average"""
-        return round(float(np.mean(self.prices[-period:])), 4)
+    def calculate_ema_trend(self, fast: int = 9, slow: int = 21) -> Tuple[str, float]:
+        """EMA-based trend detection"""
+        ema_fast = self._ema(self.closes, fast)
+        ema_slow = self._ema(self.closes, slow)
+        current_fast = ema_fast[-1]
+        current_slow = ema_slow[-1]
+        distance_pct = ((current_fast - current_slow) / current_slow) * 100 if current_slow != 0 else 0
+        if current_fast > current_slow:
+            if distance_pct > 2:
+                trend = "Strong Uptrend"
+            elif distance_pct > 0.5:
+                trend = "Uptrend"
+            else:
+                trend = "Weak Uptrend"
+        elif current_fast < current_slow:
+            if distance_pct < -2:
+                trend = "Strong Downtrend"
+            elif distance_pct < -0.5:
+                trend = "Downtrend"
+            else:
+                trend = "Weak Downtrend"
+        else:
+            trend = "Neutral"
+        return trend, round(distance_pct, 2)
 
-    def get_moving_average_signal(self) -> str:
-        """Get trend signal from moving averages"""
-        sma7, sma25 = self.calculate_sma(7), self.calculate_sma(25)
-        if sma7 > sma25 * 1.02:
-            return "Strong Uptrend"
-        if sma7 > sma25:
-            return "Mild Uptrend"
-        if sma7 < sma25 * 0.98:
-            return "Strong Downtrend"
-        if sma7 < sma25:
-            return "Mild Downtrend"
-        return "Neutral"
+    def calculate_volume_signal(self) -> Tuple[str, str]:
+        """Volume confirmation analysis"""
+        avg_volume = np.mean(self.volumes[-20:])
+        current_volume = self.volumes[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+        price_change = self.closes[-1] - self.closes[-2]
+        if volume_ratio > 2.0:
+            if price_change > 0:
+                signal = "Very Strong Bullish 🟢🟢"
+                description = "Strong buying pressure"
+            else:
+                signal = "Very Strong Bearish 🔴🔴"
+                description = "Strong selling pressure"
+        elif volume_ratio > 1.5:
+            if price_change > 0:
+                signal = "Strong Bullish 🟢"
+                description = "Price ↑ + High volume"
+            else:
+                signal = "Strong Bearish 🔴"
+                description = "Price ↓ + High volume"
+        elif volume_ratio > 1.0:
+            if price_change > 0:
+                signal = "Bullish 🟢"
+                description = "Price ↑ + Volume ↑"
+            else:
+                signal = "Bearish 🔴"
+                description = "Price ↓ + Volume ↑"
+        elif volume_ratio > 0.5:
+            signal = "Weak ⚪️"
+            description = "Low volume"
+        else:
+            signal = "Very Weak ⚪️"
+            description = "Very low volume"
+        return signal, description
 
-    def calculate_bollinger_bands(self, period: int = 20, std_dev: float = 2.0):
-        """Calculate Bollinger Bands and price position"""
-        if len(self.prices) < period:
-            return None, None, None, "Insufficient data"
-        
-        # Calculate middle band (SMA)
-        sma = float(np.mean(self.prices[-period:]))
-        
-        # Calculate standard deviation
-        std = float(np.std(self.prices[-period:]))
-        
-        # Calculate upper and lower bands
+    def calculate_bollinger_bands(self, period: int = 20, std_dev: float = 2.0) -> Tuple[float, float, float, str]:
+        """Calculate Bollinger Bands - NEW in v5.5!"""
+        if len(self.closes) < period:
+            return 0.0, 0.0, 0.0, "Insufficient data"
+        sma = float(np.mean(self.closes[-period:]))
+        std = float(np.std(self.closes[-period:]))
         upper_band = sma + (std_dev * std)
         lower_band = sma - (std_dev * std)
-        
-        # Current price
-        current_price = float(self.prices[-1])
-        
-        # Determine position and signal
+        current_price = float(self.closes[-1])
         band_width = upper_band - lower_band
         price_position = (current_price - lower_band) / band_width if band_width > 0 else 0.5
-        
-        if current_price >= upper_band:
+        if current_price >= upper_band * 1.01:
+            signal = "Strong Overbought 🔴"
+        elif current_price >= upper_band:
             signal = "Overbought 🔴"
+        elif price_position > 0.85:
+            signal = "Near Overbought"
+        elif price_position > 0.60:
+            signal = "Upper Range"
+        elif price_position >= 0.40:
+            signal = "Mid-Range ⚪️"
+        elif price_position >= 0.15:
+            signal = "Lower Range"
         elif current_price <= lower_band:
             signal = "Oversold 🟢"
-        elif price_position > 0.8:
-            signal = "Near Upper Band"
-        elif price_position < 0.2:
-            signal = "Near Lower Band"
+        elif current_price <= lower_band * 0.99:
+            signal = "Strong Oversold 🟢"
         else:
-            signal = "Mid-Range ⚪️"
-        
+            signal = "Near Oversold"
         return round(upper_band, 2), round(lower_band, 2), round(sma, 2), signal
 
-    def rating(self) -> str:
-        """Get overall market rating based on multiple indicators"""
-        rsi = self.calculate_rsi()
-        _, macd_trend = self.calculate_macd()
-        ma_signal = self.get_moving_average_signal()
-        _, _, _, bb_signal = self.calculate_bollinger_bands()
-
-        bullish = bearish = 0
+    def calculate_enhanced_rating(self) -> Tuple[str, int, Dict[str, Any]]:
+        """Enhanced rating with 5 indicators (20 points each)"""
+        score = 0
+        max_score = 100
+        details = {}
         
-        # RSI scoring
-        if rsi > 70:
-            bearish += 1
+        # 1. Enhanced RSI (20 points)
+        rsi, rsi_slope = self.calculate_rsi_enhanced()
+        details["rsi"] = rsi
+        details["rsi_slope"] = rsi_slope
+        if 40 <= rsi <= 60:
+            score += 20
+        elif 30 <= rsi < 40 and rsi_slope == "Rising":
+            score += 18
+        elif 60 < rsi <= 70 and rsi_slope == "Falling":
+            score += 15
         elif rsi < 30:
-            bullish += 1
-        
-        # MACD scoring
-        if macd_trend == "Bullish":
-            bullish += 1
+            score += 12
+        elif rsi > 70:
+            score += 10
         else:
-            bearish += 1
+            score += 16
         
-        # MA scoring
-        if "Uptrend" in ma_signal:
-            bullish += 1
-        elif "Downtrend" in ma_signal:
-            bearish += 1
+        # 2. Optimized MACD (20 points)
+        macd_val, signal_val, hist, macd_trend, macd_strength = self.calculate_macd_optimized()
+        details["macd"] = {"value": macd_val, "signal": signal_val, "trend": macd_trend, "strength": macd_strength}
+        if macd_trend == "Bullish" and macd_strength == "Strong":
+            score += 20
+        elif macd_trend == "Bullish" and macd_strength == "Weak":
+            score += 15
+        elif macd_trend == "Bearish" and macd_strength == "Strong":
+            score += 8
+        elif macd_trend == "Bearish" and macd_strength == "Weak":
+            score += 12
+        else:
+            score += 14
         
-        # Bollinger Bands scoring (bonus indicator)
-        if "Oversold" in bb_signal:
-            bullish += 0.5
-        elif "Overbought" in bb_signal:
-            bearish += 0.5
-
-        if bullish >= 3:
-            return "Strong Buy 🟢"
-        if bullish >= 2:
-            return "Buy 🟢"
-        if bearish >= 3:
-            return "Strong Sell 🔴"
-        if bearish >= 2:
-            return "Sell 🔴"
-        return "Neutral ⚪️"
+        # 3. EMA Trend (20 points)
+        ema_trend, ema_distance = self.calculate_ema_trend()
+        details["ema_trend"] = ema_trend
+        details["ema_distance"] = ema_distance
+        if "Strong Uptrend" in ema_trend:
+            score += 20
+        elif "Uptrend" in ema_trend:
+            score += 16
+        elif "Strong Downtrend" in ema_trend:
+            score += 8
+        elif "Downtrend" in ema_trend:
+            score += 12
+        else:
+            score += 14
+        
+        # 4. Volume Signal (20 points)
+        volume_signal, volume_desc = self.calculate_volume_signal()
+        details["volume_signal"] = volume_signal
+        details["volume_desc"] = volume_desc
+        if "Very Strong Bullish" in volume_signal:
+            score += 20
+        elif "Strong Bullish" in volume_signal:
+            score += 18
+        elif "Bullish" in volume_signal:
+            score += 16
+        elif "Very Strong Bearish" in volume_signal:
+            score += 5
+        elif "Strong Bearish" in volume_signal:
+            score += 8
+        elif "Bearish" in volume_signal:
+            score += 10
+        else:
+            score += 14
+        
+        # 5. Bollinger Bands (20 points) - NEW in v5.5!
+        upper_bb, lower_bb, middle_bb, bb_signal = self.calculate_bollinger_bands()
+        details["bollinger_bands"] = {
+            "upper": upper_bb,
+            "lower": lower_bb,
+            "middle": middle_bb,
+            "signal": bb_signal
+        }
+        if "Strong Oversold" in bb_signal:
+            score += 20
+        elif "Oversold" in bb_signal or "Near Oversold" in bb_signal:
+            score += 18
+        elif "Lower Range" in bb_signal:
+            score += 16
+        elif "Mid-Range" in bb_signal:
+            score += 14
+        elif "Upper Range" in bb_signal:
+            score += 12
+        elif "Overbought" in bb_signal or "Near Overbought" in bb_signal:
+            score += 10
+        elif "Strong Overbought" in bb_signal:
+            score += 5
+        else:
+            score += 14
+        
+        # Determine rating
+        if score >= 85:
+            rating = "Strong Buy 🚀"
+        elif score >= 70:
+            rating = "Buy 🚀"
+        elif score >= 55:
+            rating = "Moderate Buy 🚀"
+        elif score >= 45:
+            rating = "Neutral ⚪️"
+        elif score >= 30:
+            rating = "Moderate Sell 🔻"
+        elif score >= 15:
+            rating = "Sell 🔻"
+        else:
+            rating = "Strong Sell 🔻"
+        
+        # Market sentiment
+        if score >= 60:
+            sentiment = "Bullish 🚀"
+        elif score >= 40:
+            sentiment = "Neutral ⚪️"
+        else:
+            sentiment = "Bearish 🔻"
+        details["sentiment"] = sentiment
+        return rating, score, details
 
 # -----------------------
-# Formatting
+# Formatting Functions
 # -----------------------
 def fmt_price(v: float) -> str:
-    """Format price with appropriate decimal places"""
+    """Format price"""
     if v >= 1000:
         return f"${v:,.0f}"
     if v >= 1:
         return f"${v:,.2f}"
     return f"${v:,.6f}"
 
+def fmt_large_number(v: float) -> str:
+    """Format large numbers"""
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.1f}B"
+    elif v >= 1_000_000:
+        return f"${v / 1_000_000:.0f}M"
+    elif v >= 1_000:
+        return f"${v / 1_000:.0f}K"
+    else:
+        return f"${v:.0f}"
+
 def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
-    """Build formatted market update message with Bollinger Bands"""
+    """Build market update message"""
     symbol = symbol_in.upper().replace("/", "")
     interval = (interval_in or DEFAULT_INTERVAL).lower()
     if interval not in VALID_INTERVALS:
         interval = DEFAULT_INTERVAL
 
     resolved, exchange, note = _resolve_symbol_or_fallback(symbol)
-
     if not resolved or not exchange:
-        return (f"⚠️ Symbol `{symbol}` not found.\n"
-                f"Try `/BTCUSDT`, `/ETHUSDT`, `/XAUTUSDT`, or `/SOLUSDT`.")
+        return f"Symbol {symbol} not found.\nTry /BTC, /ETH, /SOL"
 
     t = fetch_ticker(resolved, exchange)
     if not t or "lastPrice" not in t:
-        return f"⚠️ Could not fetch 24h stats for `{resolved}` from {exchange}. Try again later."
+        return f"Could not fetch stats for {resolved}. Try again later."
 
-    kl = fetch_klines(resolved, exchange, interval=interval, limit=100)
+    # Fetch klines
+    kl = fetch_mudrex_klines(resolved, interval, limit=100)
+    if not kl or len(kl) < 50:
+        log.info(f"Mudrex klines insufficient, trying exchange...")
+        kl = fetch_klines(resolved, exchange, interval=interval, limit=100)
 
-    ta_lines = ""
-    bb_line = ""
-    if kl and len(kl) >= 30:
-        closes = [float(row[4]) for row in kl]
+    ta_details = None
+    rating = "N/A"
+    score = 0
+    sentiment = "N/A"
+    volume_signal = "N/A"
+    volume_desc = ""
+    ta_timeframe_used = interval
+    
+    # Technical analysis
+    if kl and len(kl) >= 50:
         try:
-            ta = TechnicalAnalysis(closes)
-            ta_rating = ta.rating()
-            sentiment = "Bullish 🚀" if "Buy" in ta_rating else "Bearish 🔻" if "Sell" in ta_rating else "Neutral ⚪️"
-            
-            # Get Bollinger Bands
-            upper, lower, middle, bb_signal = ta.calculate_bollinger_bands()
-            if upper and lower and middle:
-                bb_line = f"- Bollinger Bands: {bb_signal}\n"
-            
-            ta_lines = f"- Market Sentiment: {sentiment}\n- Market Trend (TA): {ta_rating}\n{bb_line}"
+            ta = EnhancedTechnicalAnalysis(kl)
+            rating, score, ta_details = ta.calculate_enhanced_rating()
+            sentiment = ta_details.get("sentiment", "N/A")
+            volume_signal = ta_details.get("volume_signal", "N/A")
+            volume_desc = ta_details.get("volume_desc", "")
         except Exception as e:
-            log.warning("TA failed for %s: %s", resolved, e)
+            log.warning("Enhanced TA failed: %s", e)
+    elif kl and len(kl) < 50:
+        log.info(f"Only {len(kl)} candles, trying 4h fallback...")
+        kl_fallback = fetch_klines(resolved, exchange, interval="4h", limit=100)
+        if kl_fallback and len(kl_fallback) >= 50:
+            try:
+                ta = EnhancedTechnicalAnalysis(kl_fallback)
+                rating, score, ta_details = ta.calculate_enhanced_rating()
+                sentiment = ta_details.get("sentiment", "N/A")
+                volume_signal = ta_details.get("volume_signal", "N/A")
+                volume_desc = ta_details.get("volume_desc", "")
+                ta_timeframe_used = "4h"
+            except Exception as e:
+                log.warning("TA fallback failed: %s", e)
 
-    last_price = float(t.get("lastPrice", 0))
-    pct = float(t.get("priceChangePercent", 0.0))
-    high = float(t.get("highPrice", last_price))
-    low = float(t.get("lowPrice", last_price))
+    # Build OI, FR, Liquidations
+    oi_line = ""
+    funding_line = ""
+    liq_line = ""
+    last_price = safe_float(t.get("lastPrice", 0))
+    
+    # PRIORITY 1: Mudrex
+    mudrex_stats = fetch_mudrex_market_stats(resolved)
+    if mudrex_stats and mudrex_stats.get("openInterest"):
+        oi_value = safe_float(mudrex_stats["openInterest"])
+        if oi_value > 0:
+            oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
+        else:
+            oi_line = "• Open Interest: Data unavailable\n"
+    else:
+        # Fallback 1: CoinGlass
+        coinglass_data = fetch_coinglass_data(resolved)
+        if coinglass_data.get("open_interest"):
+            oi_value = safe_float(coinglass_data["open_interest"])
+            if oi_value > 0:
+                oi_line = f"• Open Interest: {fmt_large_number(oi_value)}\n"
+            else:
+                oi_line = "• Open Interest: Data unavailable\n"
+        else:
+            # Fallback 2: Manual
+            manual_oi = fetch_aggregated_oi_manual(resolved, last_price)
+            if manual_oi and manual_oi > 0:
+                oi_line = f"• Open Interest: {fmt_large_number(manual_oi)}\n"
+            else:
+                # Fallback 3: Single exchange
+                exchange_oi = None
+                if exchange == "Bybit Perpetual":
+                    bybit_oi = safe_float(t.get("openInterest", 0))
+                    if bybit_oi > 0 and last_price > 0:
+                        exchange_oi = bybit_oi * last_price
+                elif exchange == "Binance Perpetual":
+                    binance_oi = fetch_binance_perp_open_interest(resolved)
+                    if binance_oi and binance_oi > 0 and last_price > 0:
+                        exchange_oi = binance_oi * last_price
+                if exchange_oi and exchange_oi > 0:
+                    oi_line = f"• Open Interest: {fmt_large_number(exchange_oi)}\n"
+                else:
+                    if exchange in ["Bybit Perpetual", "Binance Perpetual"]:
+                        oi_line = "• Open Interest: Data unavailable\n"
+                    else:
+                        oi_line = ""
+    
+    # Funding Rate
+    if mudrex_stats and mudrex_stats.get("fundingRate") is not None:
+        exchange_funding = safe_float(mudrex_stats["fundingRate"])
+    else:
+        exchange_funding = None
+        if exchange == "Bybit Perpetual":
+            exchange_funding = safe_float(t.get("fundingRate", 0))
+        elif exchange == "Binance Perpetual":
+            exchange_funding = fetch_binance_perp_funding_rate(resolved)
+    
+    if exchange_funding is not None:
+        fr_pct = exchange_funding * 100
+        if fr_pct > 0.01:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Longs paying)\n"
+        elif fr_pct < -0.01:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Shorts paying)\n"
+        else:
+            funding_line = f"• Funding Rate: {fr_pct:.4f}% (Neutral)\n"
+    else:
+        funding_line = "• Funding Rate: Neutral\n"
+    
+    # Liquidations
+    high = safe_float(t.get("highPrice", 0))
+    low = safe_float(t.get("lowPrice", 0))
+    if last_price > 0:
+        volatility = ((high - low) / last_price) * 100
+        if volatility > 5:
+            pct = safe_float(t.get("priceChangePercent", 0.0))
+            if pct > 0:
+                liq_line = "• 24H Liquidations: High shorts wiped\n"
+            else:
+                liq_line = "• 24H Liquidations: High longs wiped\n"
+        else:
+            liq_line = "• 24H Liquidations: Balanced\n"
+    else:
+        liq_line = "• 24H Liquidations: Balanced\n"
+
+    pct = safe_float(t.get("priceChangePercent", 0.0))
     arrow = "▲" if pct >= 0 else "▼"
 
-    header = f"🔸 {resolved} — Market Update"
+    header = f"🔸 [{resolved} — Market Update](https://mudrex.go.link/f8PJF)"
     if note:
-        header += f"\n(Your input `{symbol}` {note})"
+        header += f"\n{note}"
+    if ta_timeframe_used != interval and ta_details:
+        header += f"\n⚠️ TA based on {ta_timeframe_used} (insufficient {interval} data)"
+    
+    # Get Bollinger Bands signal - NEW in v5.5!
+    bb_line = ""
+    if ta_details and ta_details.get("bollinger_bands"):
+        bb_signal = ta_details["bollinger_bands"]["signal"]
+        bb_line = f"• Bollinger Bands: {bb_signal}\n"
 
     return (
-        f"{header}\n"
-        f"——————————————\n"
-        f"{ta_lines}"
-        f"- Last Price: {fmt_price(last_price)}\n"
-        f"- 24h Change: {arrow} {abs(pct):.2f}%\n"
-        f"- Day High: {fmt_price(high)}\n"
-        f"- Day Low: {fmt_price(low)}\n"
-        f"——————————————\n"
-        f"Powered by [Mudrex Market Intelligence](https://mudrex.go.link/f8PJF)"
+        f"{header}\n\n"
+        f"🔹 Market Bias - {interval.upper()}\n"
+        f"• Market Sentiment: {sentiment}\n"
+        f"• Technical Rating: {rating} (Score: {score}/100)\n"
+        f"• Volume Signal: {volume_signal} ({volume_desc})\n"
+        f"{bb_line}"
+        f"{oi_line}"
+        f"{funding_line}"
+        f"{liq_line}\n"
+        f"🔹 Stats\n"
+        f"• Last Price: {fmt_price(last_price)}\n"
+        f"• Day High: {fmt_price(high)}\n"
+        f"• Day Low: {fmt_price(low)}\n"
+        f"• 24h Change: {arrow} {abs(pct):.2f}%\n"
+        f"══════════════════════════\n"
+        f"Powered by Mudrex Market Intelligence"
     )
 
 # -----------------------
@@ -547,15 +1120,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if update.message:
         await update.message.reply_text(
-            "Welcome to Mudrex MI Bot! 🚀\n\n"
-            "Get real-time crypto market analysis with advanced technical indicators.\n\n"
+            "Welcome to Mudrex MI Bot v5.5! 🚀\n\n"
+            "Get real-time crypto perpetual futures analysis.\n\n"
             "Quick Start:\n"
-            "• `/BTCUSDT` - Get Bitcoin market update\n"
-            "• `/ETHUSDT 15m` - Get Ethereum with 15-minute timeframe\n"
-            "• `/XAUTUSDT` - Get XAUT (Gold token)\n"
-            "• `/help` - View detailed usage guide\n\n"
-            "🆕 Now with Bollinger Bands!\n\n"
-            "Try it now! Send any crypto symbol like `/BTC` or `/ETH`"
+            "• /BTC - Bitcoin perpetual\n"
+            "• /ETH 15m - Ethereum 15-minute\n"
+            "• /SOL 4h - Solana 4-hour\n"
+            "• /help - Detailed guide\n\n"
+            "🆕 v5.5: Now with Bollinger Bands!\n\n"
+            "Priority: Bybit Perp → Binance Perp → Spot\n\n"
+            "Try: /BTC or /ETH",
+            disable_web_page_preview=True
         )
 
 @retry_on_telegram_error(max_retries=3, delay=5)
@@ -563,26 +1138,31 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     if update.message:
         await update.message.reply_text(
-            "📖 *Mudrex MI Bot - Usage Guide*\n\n"
-            "*Basic Usage:*\n"
-            "• `/BTCUSDT` – Get market update (default 1h timeframe)\n"
-            "• `/BTCUSDT 15m` – Specify custom timeframe\n"
-            "• `/ETH` – Auto-resolves to ETHUSDT\n"
-            "• `/XAUTUSDT` – GOLD\n\n"
-            "*Supported Timeframes:*\n"
-            "`1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`\n\n"
-            "*Technical Indicators:*\n"
-            "✅ RSI (Relative Strength Index)\n"
-            "✅ MACD (Moving Average Convergence Divergence)\n"
-            "✅ Moving Averages (7/25 SMA)\n"
-            "✅ Bollinger Bands (Overbought/Oversold)\n"
-            "✅ Market sentiment analysis\n"
-            "✅ Buy/Sell signals\n\n"
-            "*Examples:*\n"
-            "• `/SOLUSDT` - Solana market update\n"
-            "• `/ATOM 4h` - Cosmos with 4-hour chart\n\n"
-            "Powered by [Mudrex Market Intelligence](https://mudrex.go.link/f8PJF)",
-            parse_mode="Markdown",
+            "Mudrex MI Bot v5.5 - Usage Guide\n\n"
+            "Basic Usage:\n"
+            "• /BTC – Market update (1h default)\n"
+            "• /BTC 15m – Custom timeframe\n"
+            "• /ETH – Auto-resolves to ETHUSDT\n\n"
+            "Timeframes:\n"
+            "1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w\n\n"
+            "Exchange Priority:\n"
+            "1. Bybit Perpetual\n"
+            "2. Binance Perpetual\n"
+            "3. Binance Spot (fallback)\n\n"
+            "Features:\n"
+            "✅ Real-time perpetual futures\n"
+            "✅ Open Interest (Mudrex/CoinGlass)\n"
+            "✅ 5 Technical Indicators\n"
+            "✅ Bollinger Bands 🆕\n"
+            "✅ Volume analysis\n"
+            "✅ Funding Rate\n"
+            "✅ Liquidation tracking\n\n"
+            "Examples:\n"
+            "• /BTC - Bitcoin\n"
+            "• /ETH 4h - Ethereum 4-hour\n"
+            "• /SOL 1d - Solana daily\n\n"
+            "Powered by Mudrex Market Intelligence\n"
+            "https://mudrex.go.link/f8PJF",
             disable_web_page_preview=True
         )
 
@@ -591,9 +1171,23 @@ async def any_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle any symbol command"""
     if not update.message:
         return
+    user_id = update.message.from_user.id
+    if not check_rate_limit(user_id):
+        await update.message.reply_text(
+            "⚠️ Rate limit exceeded (10 req/min). Please wait.",
+            disable_web_page_preview=True
+        )
+        return
     text = update.message.text or ""
     symbol, tf = _normalize_command(text)
-    msg = build_update(symbol, tf)
+    if not symbol:
+        await update.message.reply_text(
+            "Please provide a symbol. Examples: /BTC, /ETH, /SOL",
+            disable_web_page_preview=True
+        )
+        return
+    loop = asyncio.get_running_loop()
+    msg = await loop.run_in_executor(None, build_update, symbol, tf)
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -604,12 +1198,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Graceful Shutdown
 # -----------------------
 def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully"""
+    """Handle shutdown signals"""
     global application
-    log.info(f"🛑 Received signal {signum}. Shutting down gracefully...")
+    log.info(f"🛑 Received signal {signum}. Shutting down...")
     if application:
         try:
-            application.stop()
+            if hasattr(application, 'shutdown'):
+                asyncio.run(application.shutdown())
             log.info("✅ Bot stopped successfully")
         except Exception as e:
             log.error(f"Error during shutdown: {e}")
@@ -619,16 +1214,13 @@ def signal_handler(signum, frame):
 # Main Entry Point
 # -----------------------
 def main():
-    """Main entry point for Railway deployment"""
+    """Main entry point for Railway"""
     global application
-    
     if not TELEGRAM_TOKEN:
-        log.error("❌ TELEGRAM_TOKEN not set! Add to Railway environment variables.")
+        log.error("❌ TELEGRAM_TOKEN not set!")
         return
-
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-
     try:
         application = (
             ApplicationBuilder()
@@ -639,23 +1231,21 @@ def main():
             .pool_timeout(TELEGRAM_POOL_TIMEOUT)
             .build()
         )
-
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_cmd))
         application.add_handler(MessageHandler(filters.COMMAND, any_command))
         application.add_error_handler(on_error)
-
         log.info("=" * 60)
-        log.info("🚂 MUDREX MI BOT - ENHANCED WITH BOLLINGER BANDS")
+        log.info("🚂 MUDREX MI BOT v5.5 - ULTIMATE EDITION")
         log.info("=" * 60)
-        log.info(f"✅ Environment: Railway")
-        log.info(f"✅ Port: {PORT}")
-        log.info(f"✅ Exchanges: Binance (primary) + KuCoin (XAUT)")
-        log.info(f"✅ Indicators: RSI, MACD, MA, Bollinger Bands")
-        log.info(f"✅ Timeouts: {TELEGRAM_CONNECT_TIMEOUT}s")
-        log.info(f"✅ Starting polling mode...")
+        log.info("✅ Exchange Priority: Bybit → Binance Perp → Spot")
+        log.info("✅ Technical Indicators: 5 (RSI, MACD, EMA, Volume, BB)")
+        log.info("✅ Data: Mudrex API + CoinGlass + Manual")
+        log.info("✅ Features: OI, FR, Liquidations, Volume")
+        log.info("✅ Bollinger Bands: NEW in v5.5!")
+        log.info("✅ Rate Limiting: 10 req/min per user")
+        log.info("✅ Caching: Enabled")
         log.info("=" * 60)
-        
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -663,16 +1253,15 @@ def main():
             timeout=20,
             poll_interval=2.0
         )
-        
     except KeyboardInterrupt:
-        log.info("🛑 Received keyboard interrupt. Shutting down...")
+        log.info("🛑 Keyboard interrupt")
     except Exception as e:
         log.error(f"❌ FATAL ERROR: {e}")
         log.exception("Full traceback:")
     finally:
         if application:
-            log.info("🧹 Cleaning up resources...")
+            log.info("🧹 Cleaning up...")
 
 if __name__ == "__main__":
-    log.info("🚀 Starting Mudrex MI Bot - Enhanced Edition...")
+    log.info("🚀 Starting Mudrex MI Bot v5.5...")
     main()
