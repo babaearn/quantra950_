@@ -597,27 +597,44 @@ def _resolve_symbol_or_fallback(symbol: str) -> Tuple[Optional[str], Optional[st
     """Resolve symbol with priority: Bybit Perp → Binance Perp → Binance Spot"""
     if not symbol:
         return None, None, None
-    base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "")
+    
+    base_symbol = symbol.replace("USDT", "").replace("USDC", "").replace("FDUSD", "").replace("BUSD", "")
+    
+    # Priority 1: Bybit Perpetual with USDT
     bybit_perp_symbol = f"{base_symbol}USDT"
     if _bybit_perp_symbol_exists(bybit_perp_symbol):
         log.info(f"✅ Found {bybit_perp_symbol} on Bybit Perpetual")
         return bybit_perp_symbol, "Bybit Perpetual", None
+    
+    # Priority 2: Binance Perpetual with USDT
     binance_perp_symbol = f"{base_symbol}USDT"
     if _binance_perp_symbol_exists(binance_perp_symbol):
         log.info(f"✅ Found {binance_perp_symbol} on Binance Perpetual")
         return binance_perp_symbol, "Binance Perpetual", None
+    
+    # Priority 3: Binance Spot with USDT (for coins like XAUT)
     binance_spot_symbol = f"{base_symbol}USDT"
     if _binance_spot_symbol_exists(binance_spot_symbol):
-        log.info(f"✅ Found {binance_spot_symbol} on Binance Spot (Fallback)")
-        return binance_spot_symbol, "Binance Spot", "Using Spot (Perp not available)"
-    for quote in ["USDC", "FDUSD"]:
+        log.info(f"✅ Found {binance_spot_symbol} on Binance Spot")
+        return binance_spot_symbol, "Binance Spot", None  # Don't show "Using Spot" - just work silently
+    
+    # Try alternative quote currencies (USDC, FDUSD, BUSD)
+    for quote in ["USDC", "FDUSD", "BUSD"]:
         alt_symbol = f"{base_symbol}{quote}"
+        
         if _bybit_perp_symbol_exists(alt_symbol):
-            return alt_symbol, "Bybit Perpetual", f"Resolved to {alt_symbol}"
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Bybit Perpetual")
+            return alt_symbol, "Bybit Perpetual", None
+        
         if _binance_perp_symbol_exists(alt_symbol):
-            return alt_symbol, "Binance Perpetual", f"Resolved to {alt_symbol}"
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Binance Perpetual")
+            return alt_symbol, "Binance Perpetual", None
+        
         if _binance_spot_symbol_exists(alt_symbol):
-            return alt_symbol, "Binance Spot", f"Resolved to {alt_symbol} (Spot)"
+            log.info(f"✅ Resolved {symbol} to {alt_symbol} on Binance Spot")
+            return alt_symbol, "Binance Spot", None
+    
+    log.warning(f"❌ Symbol {symbol} not found on any exchange")
     return None, None, None
 
 # -----------------------
@@ -739,37 +756,38 @@ class EnhancedTechnicalAnalysis:
         current_volume = self.volumes[-1]
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
         price_change = self.closes[-1] - self.closes[-2]
+        
         if volume_ratio > 2.0:
             if price_change > 0:
-                signal = "Very Strong Bullish 🟢🟢"
+                signal = "Very Strong Bullish"
                 description = "Strong buying pressure"
             else:
-                signal = "Very Strong Bearish 🔴🔴"
+                signal = "Very Strong Bearish"
                 description = "Strong selling pressure"
         elif volume_ratio > 1.5:
             if price_change > 0:
-                signal = "Strong Bullish 🟢"
+                signal = "Strong Bullish"
                 description = "Price ↑ + High volume"
             else:
-                signal = "Strong Bearish 🔴"
+                signal = "Strong Bearish"
                 description = "Price ↓ + High volume"
         elif volume_ratio > 1.0:
             if price_change > 0:
-                signal = "Bullish 🟢"
+                signal = "Bullish"
                 description = "Price ↑ + Volume ↑"
             else:
-                signal = "Bearish 🔴"
+                signal = "Bearish"
                 description = "Price ↓ + Volume ↑"
         elif volume_ratio > 0.5:
-            signal = "Weak ⚪️"
+            signal = "Weak"
             description = "Low volume"
         else:
-            signal = "Very Weak ⚪️"
+            signal = "Very Weak"
             description = "Very low volume"
         return signal, description
 
     def calculate_bollinger_bands(self, period: int = 20, std_dev: float = 2.0) -> Tuple[float, float, float, str]:
-        """Calculate Bollinger Bands - NEW in v5.5!"""
+        """Calculate Bollinger Bands"""
         if len(self.closes) < period:
             return 0.0, 0.0, 0.0, "Insufficient data"
         sma = float(np.mean(self.closes[-period:]))
@@ -779,22 +797,23 @@ class EnhancedTechnicalAnalysis:
         current_price = float(self.closes[-1])
         band_width = upper_band - lower_band
         price_position = (current_price - lower_band) / band_width if band_width > 0 else 0.5
+        
         if current_price >= upper_band * 1.01:
-            signal = "Strong Overbought 🔴"
+            signal = "Strong Overbought"
         elif current_price >= upper_band:
-            signal = "Overbought 🔴"
+            signal = "Overbought"
         elif price_position > 0.85:
             signal = "Near Overbought"
         elif price_position > 0.60:
             signal = "Upper Range"
         elif price_position >= 0.40:
-            signal = "Mid-Range ⚪️"
+            signal = "Mid-Range"
         elif price_position >= 0.15:
             signal = "Lower Range"
         elif current_price <= lower_band:
-            signal = "Oversold 🟢"
+            signal = "Oversold"
         elif current_price <= lower_band * 0.99:
-            signal = "Strong Oversold 🟢"
+            signal = "Strong Oversold"
         else:
             signal = "Near Oversold"
         return round(upper_band, 2), round(lower_band, 2), round(sma, 2), signal
@@ -895,29 +914,29 @@ class EnhancedTechnicalAnalysis:
         else:
             score += 14
         
-        # Determine rating
+        # Determine rating with CLEAN emojis
         if score >= 85:
             rating = "Strong Buy 🚀"
         elif score >= 70:
             rating = "Buy 🚀"
         elif score >= 55:
-            rating = "Moderate Buy 🚀"
+            rating = "Moderate Buy ↗️"
         elif score >= 45:
-            rating = "Neutral ⚪️"
+            rating = "Neutral ➡️"
         elif score >= 30:
-            rating = "Moderate Sell 🔻"
+            rating = "Moderate Sell ↘️"
         elif score >= 15:
-            rating = "Sell 🔻"
+            rating = "Sell 📉"
         else:
-            rating = "Strong Sell 🔻"
+            rating = "Strong Sell 📉"
         
-        # Market sentiment
+        # Market sentiment with clean emojis
         if score >= 60:
             sentiment = "Bullish 🚀"
         elif score >= 40:
-            sentiment = "Neutral ⚪️"
+            sentiment = "Neutral ➡️"
         else:
-            sentiment = "Bearish 🔻"
+            sentiment = "Bearish 📉"
         details["sentiment"] = sentiment
         return rating, score, details
 
@@ -1090,14 +1109,13 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
         liq_line = "• 24H Liquidations: Balanced\n"
 
     pct = safe_float(t.get("priceChangePercent", 0.0))
-    arrow = "▲" if pct >= 0 else "▼"
+    arrow = "📈" if pct >= 0 else "📉"
 
-    header = f"🔸 [{resolved} — Market Update](https://mudrex.go.link/f8PJF)"
+    header = f"📊 {resolved} — Market Update"
     if note:
-        header += f"\n{note}"
-    # Remove TA fallback warning - not user-friendly
+        header += f"\n💡 {note}"
     
-    # Get Bollinger Bands signal - NEW in v5.5!
+    # Get Bollinger Bands signal
     bb_line = ""
     if ta_details and ta_details.get("bollinger_bands"):
         bb_signal = ta_details["bollinger_bands"]["signal"]
@@ -1105,19 +1123,19 @@ def build_update(symbol_in: str, interval_in: Optional[str]) -> str:
 
     return (
         f"{header}\n\n"
-        f"🔹 Market Bias - {interval.upper()}\n"
-        f"• Market Sentiment: {sentiment}\n"
-        f"• Technical Rating: {rating} (Score: {score}/100)\n"
-        f"• Volume Signal: {volume_signal} ({volume_desc})\n"
+        f"📈 Market Bias - {interval.upper()}\n"
+        f"• Sentiment: {sentiment}\n"
+        f"• Rating: {rating} (Score: {score}/100)\n"
+        f"• Volume: {volume_signal} ({volume_desc})\n"
         f"{bb_line}"
         f"{oi_line}"
         f"{funding_line}"
         f"{liq_line}\n"
-        f"🔹 Stats\n"
-        f"• Last Price: {fmt_price(last_price)}\n"
-        f"• Day High: {fmt_price(high)}\n"
-        f"• Day Low: {fmt_price(low)}\n"
-        f"• 24h Change: {arrow} {abs(pct):.2f}%\n"
+        f"💹 Price Stats\n"
+        f"• Current: {fmt_price(last_price)}\n"
+        f"• 24H High: {fmt_price(high)}\n"
+        f"• 24H Low: {fmt_price(low)}\n"
+        f"• 24H Change: {arrow} {abs(pct):.2f}%\n"
         f"══════════════════════════\n"
         f"Powered by Mudrex Market Intelligence"
     )
